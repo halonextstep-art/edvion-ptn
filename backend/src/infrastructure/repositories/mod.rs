@@ -1,0 +1,55 @@
+pub mod postgres_user_repository;
+pub mod postgres_question_repository;
+pub mod postgres_question_set_repository;
+pub mod postgres_tryout_repository;
+pub mod postgres_school_repository;
+pub mod postgres_school_entitlement_repository;
+pub mod postgres_analytics_repository;
+pub mod postgres_event_repository;
+pub mod postgres_package_repository;
+pub mod postgres_package_content_repository;
+pub mod postgres_package_elective_repository;
+pub mod postgres_voucher_repository;
+pub mod postgres_gamification_repository;
+pub mod postgres_rationalization_repository;
+pub mod postgres_report_repository;
+pub mod postgres_payment_repository;
+pub mod postgres_taxonomy_repository;
+pub mod postgres_simulation_repository;
+pub mod postgres_platform_settings_repository;
+pub mod postgres_notification_repository;
+pub mod postgres_institution_repository;
+pub mod postgres_question_irt_repository;
+pub mod postgres_admission_deadline_repository;
+
+pub use postgres_user_repository::PostgresUserRepository;
+pub use postgres_question_repository::PostgresQuestionRepository;
+pub use postgres_question_set_repository::PostgresQuestionSetRepository;
+pub use postgres_tryout_repository::{PostgresAttemptRepository, PostgresTryoutSessionRepository};
+pub use postgres_school_repository::PostgresSchoolRepository;
+pub use postgres_school_entitlement_repository::PostgresSchoolEntitlementRepository;
+pub use postgres_analytics_repository::PostgresAnalyticsRepository;
+pub use postgres_event_repository::PostgresEventRepository;
+pub use postgres_package_repository::PostgresPackageRepository;
+pub use postgres_package_content_repository::PostgresPackageContentRepository;
+pub use postgres_package_elective_repository::PostgresPackageElectiveRepository;
+pub use postgres_voucher_repository::PostgresVoucherRepository;
+pub use postgres_gamification_repository::{
+    PostgresBadgeRepository, PostgresChallengeRepository, PostgresLeaderboardRepository, PostgresPointRuleRepository,
+};
+pub use postgres_rationalization_repository::{
+    PostgresAchievementRepository, PostgresAlumniBenchmarkRepository, PostgresAuditLogRepository,
+    PostgresPtnProgramRepository, PostgresPtnTargetRepository, PostgresRaporScoreRepository,
+    PostgresSchoolEligibilityRepository, PostgresSnbpParticipationRepository, PostgresSnbtTrackingRepository,
+};
+pub use postgres_report_repository::PostgresReportRepository;
+pub use postgres_payment_repository::PostgresPaymentTransactionRepository;
+pub use postgres_taxonomy_repository::PostgresTaxonomyRepository;
+pub use postgres_simulation_repository::{
+    PostgresLockdownViolationRepository, PostgresSimulationRunRepository, PostgresSimulationTemplateRepository,
+};
+pub use postgres_platform_settings_repository::PostgresPlatformSettingsRepository;
+pub use postgres_notification_repository::PostgresNotificationRepository;
+pub use postgres_institution_repository::PostgresInstitutionRepository;
+pub use postgres_question_irt_repository::PostgresQuestionIrtParamRepository;
+pub use postgres_admission_deadline_repository::PostgresAdmissionDeadlineRepository;

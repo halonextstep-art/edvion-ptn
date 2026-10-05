@@ -1,0 +1,40 @@
+[package]
+name = "edvionptn-backend"
+version = "0.1.0"
+edition = "2021"
+description = "EdvionPTN backend - layered OOP architecture (domain / application / infrastructure / interfaces)"
+default-run = "edvionptn-backend"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros", "multipart"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
+
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+jsonwebtoken = "9"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["std"] }
+
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+validator = { version = "0.18", features = ["derive"] }
+csv = "1"
+
+# Reads the .docx bulk question-import file as a zip archive (see
+# infrastructure::docx_reader). Deflate-only — DOCX never uses bzip2/zstd/AES compression, so
+# the heavier default feature set is disabled to keep the dependency tree small.
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

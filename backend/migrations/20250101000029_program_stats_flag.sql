@@ -1,0 +1,11 @@
+-- Flags whether a `ptn_programs` row has real, official admission statistics (daya
+-- tampung/peminat/passing grade) behind it. The original 4588-row imported catalog
+-- (source: "Hitungan Rasionalisasi.xlsx" / official SNBP-SNBT statistics) all get `true`.
+-- Programs added later purely from descriptive research (name/jenjang/rumpun known, but no
+-- verified official quota/applicant/passing-grade numbers) get `false` so the rationalization
+-- engine (`compute_chance`/`compute_chance_snbp`) can refuse to fabricate a chance estimate
+-- for them instead of silently defaulting the missing numbers to 0 (which — see
+-- `PtnProgram::competition_ratio_snbp/snbt` and `compute_chance`'s zero-threshold fallback —
+-- would otherwise read as "no competition" / "at the threshold" and produce a falsely
+-- optimistic "Aman" result).
+ALTER TABLE ptn_programs ADD COLUMN has_official_stats BOOLEAN NOT NULL DEFAULT true;

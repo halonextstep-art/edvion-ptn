@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens — approximates the reference Figma theme (indigo/purple/pink brand). */
+:root {
+  --background: 0 0% 100%;
+  --foreground: 222 47% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 47% 11%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222 47% 11%;
+  --primary: 243 75% 59%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 40% 96%;
+  --secondary-foreground: 222 47% 11%;
+  --muted: 210 40% 96%;
+  --muted-foreground: 215 16% 47%;
+  --accent: 210 40% 96%;
+  --accent-foreground: 222 47% 11%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 214 32% 91%;
+  --input: 214 32% 91%;
+  --ring: 243 75% 59%;
+  --radius: 0.75rem;
+}
+
+/* Dark theme — scoped to the Tim Konten portal only (see tailwind.config.ts darkMode:
+   'class' and pages/konten/index.vue's root `.dark` class). Approximates referensi's
+   ContentDashboard.tsx palette (near-black bg, translucent white surfaces). */
+.dark {
+  --background: 258 30% 6%;
+  --foreground: 0 0% 100%;
+  --card: 258 25% 9%;
+  --card-foreground: 0 0% 100%;
+  --popover: 258 25% 9%;
+  --popover-foreground: 0 0% 100%;
+  --primary: 258 90% 66%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 258 20% 16%;
+  --secondary-foreground: 0 0% 100%;
+  --muted: 258 20% 16%;
+  --muted-foreground: 240 10% 65%;
+  --accent: 258 20% 16%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 70% 55%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 258 15% 22%;
+  --input: 258 15% 22%;
+  --ring: 258 90% 66%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html {
+  /* Menghilangkan kotak abu-abu sesaat saat tap di mobile (bawaan WebKit) — salah satu hal
+     kecil yang paling kentara membedakan "terasa web" vs "terasa app" di HP. */
+  -webkit-tap-highlight-color: transparent;
+  /* Jaring pengaman terhadap overflow horizontal yang tidak sengaja (chart, dropdown lebar,
+     dsb yang lolos dari constraint-nya) — sengaja pakai `clip`, BUKAN `overflow-x: hidden`.
+     `hidden` mengubah elemen jadi scroll container baru, dan kombinasi `overflow-x: hidden`
+     di html+body PERNAH bikin seluruh halaman tidak bisa di-scroll SAMA SEKALI di WebKit
+     mobile (interaksi buruk dengan `overscroll-behavior-y: none` di body, lihat komentar di
+     bawah) — sudah pernah terjadi & di-revert sebelumnya. `clip` murni memotong SECARA VISUAL
+     konten yang meluber tanpa membuat elemen ini jadi scroll container, jadi tidak
+     mengganggu scroll vertikal normal maupun momentum-scroll iOS sama sekali. Hanya di html
+     (bukan body juga) untuk memperkecil lagi risiko regresi yang sama. */
+  overflow-x: clip;
+  /* Eksplisit (bukan cuma andalkan default `visible`) — sebagian browser meng-interop-kan
+     overflow-x & overflow-y sepasang saat salah satunya bukan `visible`; menyebutkannya
+     eksplisit di sini memastikan scroll vertikal halaman tidak ikut terpengaruh di browser mana pun. */
+  overflow-y: visible;
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  /* Matikan efek "rubber-band"/pull-to-refresh bawaan browser mobile pada scroll vertikal
+     halaman — pola native-app (bukan pull-to-refresh halaman web biasa). Elemen yang memang
+     butuh scroll sendiri (drawer, dialog, dsb) tidak terpengaruh, ini cuma di level body. */
+  overscroll-behavior-y: none;
+}
+
+/* Sembunyikan scrollbar bawaan browser di layar mobile (<lg, breakpoint yang sama dipakai
+   MobileBottomNav/TabsList) — pola yang SAMA persis sudah dipakai di beberapa strip
+   horizontal-scroll lain di proyek ini (mis. TabsList siswa/index.vue, carousel pages/index.vue),
+   di sini diterapkan ke scrollbar VERTIKAL utama halaman. Scroll tetap berfungsi normal (cuma
+   indikator visualnya yang disembunyikan) — scrollbar klasik/non-overlay browser desktop yang
+   dipakai untuk merender preview mobile bisa terlihat seperti garis abu-abu di tepi kanan layar,
+   yang membuat tampilan terasa "web", bukan app native. Dibatasi ke <lg supaya portal Admin/
+   Sekolah di desktop tetap punya scrollbar terlihat (kebutuhan aksesibilitas/kegunaan untuk
+   tabel & daftar panjang). */
+@media (max-width: 1023px) {
+  html {
+    scrollbar-width: none;
+  }
+  html::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Fade halus antar-halaman — lihat app.head.pageTransition di nuxt.config.ts. */
+.page-enter-active,
+.page-leave-active {
+  transition: opacity 0.15s ease;
+}
+.page-enter-from,
+.page-leave-to {
+  opacity: 0;
+}

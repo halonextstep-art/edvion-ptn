@@ -1,0 +1,44 @@
+nama_ptn,nama_prodi,provinsi,kota,singkatan,rumpun,mapel_syarat,jenjang
+INSTITUT PERTANIAN BOGOR,KEDOKTERAN,Prov. Jawa Barat,Kota Bogor,IPB,Ilmu atau Sains Kedokteran,"Biologi, Kimia",S1
+INSTITUT PERTANIAN BOGOR,SAINS BIOMEDIS,Prov. Jawa Barat,Kota Bogor,IPB,Ilmu atau Sains Kedokteran,"Biologi, Kimia",S1
+INSTITUT PERTANIAN BOGOR,SMART AGRICULTURE,Prov. Jawa Barat,Kota Bogor,IPB,Ilmu dan Sains Pertanian,"Biologi, Matematika",S1
+INSTITUT PERTANIAN BOGOR,BIOINFORMATIKA,Prov. Jawa Barat,Kota Bogor,IPB,"Bioteknologi, Biokewirausaha an, Bioinformatika","Biologi, Matematika",S1
+INSTITUT PERTANIAN BOGOR,KECERDASAN BUATAN,Prov. Jawa Barat,Kota Bogor,IPB,Komputer,"Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI KALIMANTAN,TEKNIK BIOMEDIS,Prov. Kalimantan Timur,Kota Balikpapan,ITK,Teknik atau rekayasa,"Fisika, Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI KALIMANTAN,TEKNIK SISTEM PERKAPALAN,Prov. Kalimantan Timur,Kota Balikpapan,ITK,Teknik atau rekayasa,"Fisika, Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI KALIMANTAN,TEKNIK TRANSPORTASI LAUT,Prov. Kalimantan Timur,Kota Balikpapan,ITK,Transportasi,"Fisika, Matematika",S1
+INSTITUT TEKNOLOGI SEPULUH NOPEMBER,BIOTEKNOLOGI,Prov. Jawa Timur,Kota Surabaya,ITS,"Bioteknologi, Biokewirausaha an, Bioinformatika","Biologi, Kimia",S1
+INSTITUT TEKNOLOGI SEPULUH NOPEMBER,SAINS KOMUNIKASI,Prov. Jawa Timur,Kota Surabaya,ITS,Ilmu atau Sains Komunikasi,"Bahasa Indonesia, Bahasa Inggris",S1
+INSTITUT TEKNOLOGI SEPULUH NOPEMBER,BISNIS DIGITAL,Prov. Jawa Timur,Kota Surabaya,ITS,Bisnis,"Ekonomi, Matematika",S1
+INSTITUT TEKNOLOGI SEPULUH NOPEMBER,REKAYASA KESELAMATAN PROSES,Prov. Jawa Timur,Kota Surabaya,ITS,Teknik atau rekayasa,"Fisika, Kimia, Matematika",S1
+INSTITUT TEKNOLOGI SEPULUH NOPEMBER,ANALITIKA LOGISTIK TERAPAN,Prov. Jawa Timur,Kota Surabaya,ITS,Logistik,"Matematika, Ekonomi",D4
+INSTITUT TEKNOLOGI SEPULUH NOPEMBER,INOVASI DIGITAL,Prov. Jawa Timur,Kota Surabaya,ITS,Ilmu atau Sains Informasi,"Matematika, Ekonomi",S1
+INSTITUT TEKNOLOGI SUMATERA,REKAYASA KEOLAHRAGAAN,Prov. Lampung,Kabupaten Lampung Selatan,ITERA,Ilmu atau Sains Keolahragaan,"Biologi, Fisika",S1
+ISBI ACEH,KAJIAN SASTRA DAN BUDAYA,Prov. Aceh,Kab Aceh Besar,ISBI ACEH,Susastra atau Sastra,"Bahasa Indonesia, Sejarah",S1
+ISBI ACEH,BAHASA ACEH,Prov. Aceh,Kab Aceh Besar,ISBI ACEH,Linguistik,"Bahasa Indonesia, Sejarah",S1
+ISBI ACEH,DESAIN INTERIOR,Prov. Aceh,Kab Aceh Besar,ISBI ACEH,Desain,,S1
+ISBI BANDUNG,DESAIN KOMUNIKASI VISUAL (DKV),Prov. Jawa Barat,Kota Bandung,ISBI BANDUNG,Desain,,S1
+ISBI BANDUNG,DESAIN INTERIOR,Prov. Jawa Barat,Kota Bandung,ISBI BANDUNG,Desain,,S1
+ISI SURAKARTA,KOREOGRAFI INKUIRI,Prov. Jawa Tengah,Kota Surakarta,ISI SURAKARTA,Seni,,S1
+ISI SURAKARTA,TATA KELOLA SENI,Prov. Jawa Tengah,Kota Surakarta,ISI SURAKARTA,Manajemen Seni,,D4
+ISI SURAKARTA,BISNIS MUSIK,Prov. Jawa Tengah,Kota Surakarta,ISI SURAKARTA,Seni,,S1
+ISI SURAKARTA,ANIMASI,Prov. Jawa Tengah,Kota Surakarta,ISI SURAKARTA,Desain,,D4
+ISI SURAKARTA,SENI INTERMEDIA,Prov. Jawa Tengah,Kota Surakarta,ISI SURAKARTA,Seni,,S1
+ISI SURAKARTA,DESAIN PRODUK INDUSTRI,Prov. Jawa Tengah,Kota Surakarta,ISI SURAKARTA,Desain,,S1
+ISI SURAKARTA,DESTINASI PARIWISATA,Prov. Jawa Tengah,Kota Surakarta,ISI SURAKARTA,Pariwisata,,D4
+ISI SURAKARTA,ARSITEKTUR,Prov. Jawa Tengah,Kota Surakarta,ISI SURAKARTA,Arsitektur,,S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNOLOGI PANGAN,Prov. Sulawesi Selatan,Kota Parepare,ITH,"Teknologi Pangan, Teknologi Hasil Pertanian/ Peternakan/ Perikanan","Biologi, Kimia",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,SAINS DATA,Prov. Sulawesi Selatan,Kota Parepare,ITH,Sains Data,"Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,SAINS AKTUARIA,Prov. Sulawesi Selatan,Kota Parepare,ITH,Sains Data,"Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK SISTEM ENERGI,Prov. Sulawesi Selatan,Kota Parepare,ITH,Teknik atau rekayasa,"Fisika, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK METALURGI,Prov. Sulawesi Selatan,Kota Parepare,ITH,Teknik atau rekayasa,"Fisika, Kimia, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,BIOTEKNOLOGI,Prov. Sulawesi Selatan,Kota Parepare,ITH,"Bioteknologi, Biokewirausaha an, Bioinformatika","Biologi, Kimia",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK SIPIL,Prov. Sulawesi Selatan,Kota Parepare,ITH,Teknik atau rekayasa,"Fisika, Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,ARSITEKTUR,Prov. Sulawesi Selatan,Kota Parepare,ITH,Arsitektur,"Matematika, Fisika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK PERKAPALAN,Prov. Sulawesi Selatan,Kota Parepare,ITH,Teknik atau rekayasa,"Fisika, Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK ROBOTIKA DAN KECERDASAN BUATAN,Prov. Sulawesi Selatan,Kota Parepare,ITH,Komputer,"Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK INDUSTRI,Prov. Sulawesi Selatan,Kota Parepare,ITH,Teknik atau rekayasa,"Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK LINGKUNGAN,Prov. Sulawesi Selatan,Kota Parepare,ITH,Teknik atau rekayasa,"Biologi, Kimia, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK MESIN,Prov. Sulawesi Selatan,Kota Parepare,ITH,Teknik atau rekayasa,"Fisika, Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,TEKNIK ELEKTRO,Prov. Sulawesi Selatan,Kota Parepare,ITH,Teknik atau rekayasa,"Fisika, Matematika Tingkat Lanjut, Matematika",S1
+INSTITUT TEKNOLOGI BJ. HABIBIE SULAWESI SELATAN,BISNIS DIGITAL,Prov. Sulawesi Selatan,Kota Parepare,ITH,Bisnis,"Ekonomi, Matematika",S1
