@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::domain::package::{Package, PackageContentType};
 use crate::domain::repository::{PackageContentRepository, PackageElectiveRepository, PackageRepository, TryoutSessionRepository};
+use crate::domain::tenant::TenantCtx;
 use crate::domain::tryout::TryoutSession;
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
@@ -49,17 +50,17 @@ impl ElectiveService {
     /// This student's current picks for this package (empty list if they haven't chosen yet).
     pub async fn my_choices(&self, actor: &AuthUser, package_id: Uuid) -> AppResult<Vec<Uuid>> {
         actor.require_role(&[Role::Student])?;
-        self.choices.list_choices(actor.user_id, package_id).await
+        self.choices.list_choices(actor.user_id, package_id, &actor.tenant).await
     }
 
     /// Combined view for the student-facing "Pilih Mapel Pilihan" screen — one round trip
     /// instead of three. `(sessions, elective_pick_count, my_current_choices)`.
     pub async fn get_electives_view(&self, actor: &AuthUser, package_id: Uuid) -> AppResult<(Vec<TryoutSession>, i32, Vec<Uuid>)> {
         actor.require_role(&[Role::Student])?;
-        let pkg = self.packages.find_by_id(package_id).await?
+        let pkg = self.packages.find_by_id(package_id, &actor.tenant).await?
             .ok_or_else(|| AppError::NotFound(format!("package {package_id} not found")))?;
-        let sessions = self.elective_sessions(package_id).await?;
-        let my_choices = self.choices.list_choices(actor.user_id, package_id).await?;
+        let sessions = self.elective_sessions(package_id, &actor.tenant).await?;
+        let my_choices = self.choices.list_choices(actor.user_id, package_id, &actor.tenant).await?;
         Ok((sessions, pkg.elective_pick_count, my_choices))
     }
 
@@ -70,7 +71,7 @@ impl ElectiveService {
     /// session id from elsewhere).
     pub async fn set_choices(&self, actor: &AuthUser, package_id: Uuid, session_ids: Vec<Uuid>) -> AppResult<Vec<Uuid>> {
         actor.require_role(&[Role::Student])?;
-        let pkg = self.packages.find_by_id(package_id).await?
+        let pkg = self.packages.find_by_id(package_id, &actor.tenant).await?
             .ok_or_else(|| AppError::NotFound(format!("package {package_id} not found")))?;
 
         // De-dupe defensively — a client resubmitting the same id twice shouldn't count as 2
@@ -90,7 +91,7 @@ impl ElectiveService {
             )));
         }
 
-        let valid_ids: HashSet<Uuid> = self.elective_sessions(package_id).await?.into_iter().map(|s| s.id).collect();
+        let valid_ids: HashSet<Uuid> = self.elective_sessions(package_id, &actor.tenant).await?.into_iter().map(|s| s.id).collect();
         for id in &deduped {
             if !valid_ids.contains(id) {
                 return Err(AppError::Validation(
@@ -99,7 +100,7 @@ impl ElectiveService {
             }
         }
 
-        self.choices.set_choices(actor.user_id, package_id, deduped.clone()).await?;
+        self.choices.set_choices(actor.user_id, package_id, deduped.clone(), &actor.tenant).await?;
         Ok(deduped)
     }
 
@@ -110,17 +111,17 @@ impl ElectiveService {
     /// `elective_pick_count = 0`) are silently omitted rather than shown empty.
     pub async fn list_my_elective_packages(&self, actor: &AuthUser) -> AppResult<Vec<PackageElectiveGroup>> {
         actor.require_role(&[Role::Student])?;
-        let all_packages = self.packages.list().await?;
+        let all_packages = self.packages.list(&actor.tenant).await?;
         let mut groups = Vec::new();
         for pkg in all_packages {
             if pkg.elective_pick_count <= 0 {
                 continue;
             }
-            let sessions = self.elective_sessions(pkg.id).await?;
+            let sessions = self.elective_sessions(pkg.id, &actor.tenant).await?;
             if sessions.is_empty() {
                 continue;
             }
-            let my_choices = self.choices.list_choices(actor.user_id, pkg.id).await?;
+            let my_choices = self.choices.list_choices(actor.user_id, pkg.id, &actor.tenant).await?;
             groups.push(PackageElectiveGroup { package: pkg, sessions, my_choices });
         }
         Ok(groups)
@@ -133,17 +134,17 @@ impl ElectiveService {
     /// DB-enforced — fails open here rather than blocking a session forever; the content-
     /// authoring side already gates real visibility via `is_draft`/`is_premium` separately).
     /// `Err(Forbidden)` when the session IS gated and this student hasn't currently chosen it.
-    pub(crate) async fn assert_can_start(&self, student_id: Uuid, session: &TryoutSession) -> AppResult<()> {
+    pub(crate) async fn assert_can_start(&self, student_id: Uuid, session: &TryoutSession, ctx: &TenantCtx) -> AppResult<()> {
         if !session.is_elective {
             return Ok(());
         }
-        let package_ids = self.content.package_ids_for_content(PackageContentType::TryoutSession, session.id).await?;
+        let package_ids = self.content.package_ids_for_content(PackageContentType::TryoutSession, session.id, ctx).await?;
         for package_id in package_ids {
-            let Some(pkg) = self.packages.find_by_id(package_id).await? else { continue };
+            let Some(pkg) = self.packages.find_by_id(package_id, ctx).await? else { continue };
             if pkg.elective_pick_count <= 0 {
                 continue;
             }
-            let chosen = self.choices.list_choices(student_id, package_id).await?;
+            let chosen = self.choices.list_choices(student_id, package_id, ctx).await?;
             if !chosen.contains(&session.id) {
                 return Err(AppError::Forbidden(format!(
                     "\"{}\" termasuk mapel pilihan paket \"{}\" — pilih mapel ini dulu di halaman \"Pilih Mapel Pilihan\" (maks {} mapel) sebelum mengerjakan",
@@ -155,14 +156,14 @@ impl ElectiveService {
     }
 
     /// Shared lookup: every non-draft `is_elective` `TryoutSession` attached to this package.
-    async fn elective_sessions(&self, package_id: Uuid) -> AppResult<Vec<TryoutSession>> {
-        let items = self.content.list_for_package(package_id).await?;
+    async fn elective_sessions(&self, package_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<TryoutSession>> {
+        let items = self.content.list_for_package(package_id, ctx).await?;
         let mut out = Vec::new();
         for item in items {
             if item.content_type != PackageContentType::TryoutSession {
                 continue;
             }
-            if let Some(session) = self.sessions.find_by_id(item.content_id).await? {
+            if let Some(session) = self.sessions.find_by_id(item.content_id, ctx).await? {
                 if session.is_elective && !session.is_draft {
                     out.push(session);
                 }

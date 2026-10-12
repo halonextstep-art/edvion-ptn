@@ -7,6 +7,7 @@
 //! implements it.
 
 pub mod user;
+pub mod tenant;
 pub mod school;
 pub mod question;
 pub mod question_set;
@@ -31,6 +32,7 @@ pub mod admission_deadline;
 pub mod repository;
 
 pub use user::{Role, User};
+pub use tenant::TenantCtx;
 pub use school::School;
 pub use question::{Question, QuestionStatus, QuestionType, Difficulty};
 pub use question_set::QuestionSet;

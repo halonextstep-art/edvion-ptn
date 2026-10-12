@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::domain::package::Package;
 use crate::domain::repository::{NewVoucher, PackageRepository, VoucherRepository};
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::domain::voucher::{DiscountType, Voucher, VoucherStatus, VoucherType};
 use crate::error::{AppError, AppResult};
@@ -65,7 +66,7 @@ impl VoucherService {
 
     pub async fn create(&self, actor: &AuthUser, input: CreateVoucherInput) -> AppResult<Vec<Voucher>> {
         actor.require_role(&[Role::Admin])?;
-        self.ensure_package_exists(input.package_id).await?;
+        self.ensure_package_exists(input.package_id, &actor.tenant).await?;
         if input.discount_type == DiscountType::Percent && !(0..=100).contains(&input.discount_value) {
             return Err(AppError::Validation("diskon persen harus antara 0-100".to_string()));
         }
@@ -90,21 +91,21 @@ impl VoucherService {
         }
 
         if batch.len() == 1 {
-            Ok(vec![self.vouchers.create(batch.into_iter().next().unwrap()).await?])
+            Ok(vec![self.vouchers.create(batch.into_iter().next().unwrap(), &actor.tenant).await?])
         } else {
-            self.vouchers.create_batch(batch).await
+            self.vouchers.create_batch(batch, &actor.tenant).await
         }
     }
 
     pub async fn list(&self, actor: &AuthUser) -> AppResult<Vec<Voucher>> {
         actor.require_role(&[Role::Admin])?;
-        self.vouchers.list().await
+        self.vouchers.list(&actor.tenant).await
     }
 
     pub async fn get(&self, actor: &AuthUser, id: Uuid) -> AppResult<Voucher> {
         actor.require_role(&[Role::Admin])?;
         self.vouchers
-            .find_by_id(id)
+            .find_by_id(id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("voucher {id} not found")))
     }
@@ -112,7 +113,7 @@ impl VoucherService {
     pub async fn set_active(&self, actor: &AuthUser, id: Uuid, active: bool) -> AppResult<Voucher> {
         actor.require_role(&[Role::Admin])?;
         self.vouchers
-            .set_active(id, active)
+            .set_active(id, active, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("voucher {id} not found")))
     }
@@ -121,13 +122,13 @@ impl VoucherService {
         actor.require_role(&[Role::Admin])?;
         let v = self
             .vouchers
-            .find_by_id(id)
+            .find_by_id(id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("voucher {id} not found")))?;
         if v.used_count > 0 {
             return Err(AppError::Conflict("voucher yang sudah dipakai tidak bisa dihapus".to_string()));
         }
-        self.vouchers.delete(id).await?;
+        self.vouchers.delete(id, &actor.tenant).await?;
         Ok(())
     }
 
@@ -141,9 +142,12 @@ impl VoucherService {
         if trimmed.is_empty() {
             return Err(AppError::Validation("kode voucher wajib diisi".to_string()));
         }
+        // A voucher code is global (not scoped to the redeemer's own tenant — anyone with the
+        // code may redeem it, that's the point), so the lookup itself must be platform-wide;
+        // only the redemption write below is scoped to the actor's own tenant.
         let voucher = self
             .vouchers
-            .find_by_code(trimmed)
+            .find_by_code(trimmed, &TenantCtx::platform_admin())
             .await?
             .ok_or_else(|| AppError::NotFound("kode voucher tidak ditemukan".to_string()))?;
 
@@ -154,10 +158,10 @@ impl VoucherService {
             VoucherStatus::Inactive => return Err(AppError::Validation("voucher ini sedang tidak aktif".to_string())),
         }
 
-        let updated = self.vouchers.redeem(voucher.id, actor.user_id).await?;
+        let updated = self.vouchers.redeem(voucher.id, actor.user_id, &actor.tenant).await?;
         let package = self
             .packages
-            .find_by_id(updated.package_id)
+            .find_by_id(updated.package_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("package referenced by voucher vanished")))?;
         Ok(RedemptionResult { voucher: updated, package })
@@ -179,7 +183,7 @@ impl VoucherService {
         if trimmed.is_empty() {
             return Ok(VoucherCheckResult { reason: Some("kode voucher wajib diisi".to_string()), ..empty() });
         }
-        let Some(voucher) = self.vouchers.find_by_code(trimmed).await? else {
+        let Some(voucher) = self.vouchers.find_by_code(trimmed, &TenantCtx::platform_admin()).await? else {
             return Ok(VoucherCheckResult { reason: Some("kode voucher tidak ditemukan".to_string()), ..empty() });
         };
 
@@ -208,31 +212,38 @@ impl VoucherService {
     /// generates a real single-use Access voucher and immediately redeems it for the buyer,
     /// so the student doesn't have to separately type in a code. No role check here: the
     /// caller (`PaymentService::fulfill`) already requires `Role::Admin` before calling this.
+    /// Uses `TenantCtx::platform_admin()` throughout — an admin genuinely has cross-tenant
+    /// write authority here (RLS's `OR is_platform_admin` bypass), which sidesteps needing
+    /// to resolve the buyer's own tenant id just to satisfy the `tenant_id` column default.
     pub async fn grant_access(&self, package_id: Uuid, buyer_user_id: Uuid, created_by: Uuid, note: String) -> AppResult<Voucher> {
-        self.ensure_package_exists(package_id).await?;
+        let ctx = TenantCtx::platform_admin();
+        self.ensure_package_exists(package_id, &ctx).await?;
         let voucher = self
             .vouchers
-            .create(NewVoucher {
-                code: generate_code(VoucherType::Access),
-                voucher_type: VoucherType::Access,
-                package_id,
-                discount_type: DiscountType::Full,
-                discount_value: 100,
-                max_uses: 1,
-                expires_at: (Utc::now() + chrono::Duration::days(365)).date_naive(),
-                note,
-                school_name: None,
-                referrer_name: None,
-                referrer_commission: None,
-                created_by,
-            })
+            .create(
+                NewVoucher {
+                    code: generate_code(VoucherType::Access),
+                    voucher_type: VoucherType::Access,
+                    package_id,
+                    discount_type: DiscountType::Full,
+                    discount_value: 100,
+                    max_uses: 1,
+                    expires_at: (Utc::now() + chrono::Duration::days(365)).date_naive(),
+                    note,
+                    school_name: None,
+                    referrer_name: None,
+                    referrer_commission: None,
+                    created_by,
+                },
+                &ctx,
+            )
             .await?;
-        self.vouchers.redeem(voucher.id, buyer_user_id).await
+        self.vouchers.redeem(voucher.id, buyer_user_id, &ctx).await
     }
 
-    async fn ensure_package_exists(&self, package_id: Uuid) -> AppResult<()> {
+    async fn ensure_package_exists(&self, package_id: Uuid, ctx: &TenantCtx) -> AppResult<()> {
         self.packages
-            .find_by_id(package_id)
+            .find_by_id(package_id, ctx)
             .await?
             .ok_or_else(|| AppError::Validation("paket yang dipilih tidak ditemukan".to_string()))?;
         Ok(())

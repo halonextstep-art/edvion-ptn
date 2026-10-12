@@ -20,6 +20,7 @@ use crate::domain::repository::{
 use crate::domain::package::ExamTrack;
 use crate::domain::platform_settings::ScoreDisplayMode;
 use crate::domain::school::SchoolType;
+use crate::domain::tenant::TenantCtx;
 use crate::domain::tryout::{compute_score, Attempt, SessionType, TryoutSession};
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
@@ -242,13 +243,13 @@ impl TryoutService {
     /// Neither rule applies to a B2C student (no school) — their jenjang can't be determined,
     /// so both filters are skipped entirely for them rather than hiding everything.
     pub async fn list_sessions(&self, actor: &AuthUser, session_type: Option<SessionType>) -> AppResult<Vec<TryoutSession>> {
-        let sessions = self.sessions.list(session_type).await?;
+        let sessions = self.sessions.list(session_type, &actor.tenant).await?;
         let mut visible: Vec<TryoutSession> = match actor.role {
             Role::Admin | Role::Content => sessions,
             _ => sessions.into_iter().filter(|s| !s.is_draft).collect(),
         };
         if actor.role == Role::Student {
-            if let Some(student_type) = self.access.student_school_type(actor.user_id).await? {
+            if let Some(student_type) = self.access.student_school_type(actor.user_id, &actor.tenant).await? {
                 visible.retain(|s| match s.school_type_scope {
                     None => true,
                     Some(t) => t == student_type,
@@ -288,13 +289,13 @@ impl TryoutService {
                 is_elective: input.is_elective,
                 exam_track: input.exam_track,
                 school_type_scope: input.school_type_scope,
-            })
+            }, &actor.tenant)
             .await
     }
 
-    pub async fn get_session(&self, session_id: Uuid) -> AppResult<TryoutSession> {
+    pub async fn get_session(&self, session_id: Uuid, ctx: &TenantCtx) -> AppResult<TryoutSession> {
         self.sessions
-            .find_by_id(session_id)
+            .find_by_id(session_id, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("session {session_id} not found")))
     }
@@ -307,7 +308,7 @@ impl TryoutService {
     ) -> AppResult<TryoutSession> {
         actor.require_role(&[Role::Admin, Role::Content])?;
         if actor.role != Role::Admin {
-            let existing = self.get_session(session_id).await?;
+            let existing = self.get_session(session_id, &actor.tenant).await?;
             if existing.created_by != actor.user_id {
                 return Err(AppError::Forbidden("Anda hanya bisa mengubah sesi yang Anda buat sendiri".to_string()));
             }
@@ -333,6 +334,7 @@ impl TryoutService {
                     exam_track: input.exam_track,
                     school_type_scope: input.school_type_scope,
                 },
+                &actor.tenant,
             )
             .await?
             .ok_or_else(|| AppError::NotFound(format!("session {session_id} not found")))
@@ -341,12 +343,12 @@ impl TryoutService {
     pub async fn delete_session(&self, actor: &AuthUser, session_id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin, Role::Content])?;
         if actor.role != Role::Admin {
-            let existing = self.get_session(session_id).await?;
+            let existing = self.get_session(session_id, &actor.tenant).await?;
             if existing.created_by != actor.user_id {
                 return Err(AppError::Forbidden("Anda hanya bisa menghapus sesi yang Anda buat sendiri".to_string()));
             }
         }
-        let deleted = self.sessions.delete(session_id).await?;
+        let deleted = self.sessions.delete(session_id, &actor.tenant).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("session {session_id} not found")));
         }
@@ -356,9 +358,9 @@ impl TryoutService {
     /// Called directly by `PackageService::set_active`'s publish cascade (crosses the
     /// module boundary intentionally — see that method's doc comment) and by an owner
     /// manually un-hiding/re-hiding their own session from the catalogue.
-    pub async fn set_draft(&self, session_id: Uuid, is_draft: bool) -> AppResult<TryoutSession> {
+    pub async fn set_draft(&self, session_id: Uuid, is_draft: bool, ctx: &TenantCtx) -> AppResult<TryoutSession> {
         self.sessions
-            .set_draft(session_id, is_draft)
+            .set_draft(session_id, is_draft, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("session {session_id} not found")))
     }
@@ -382,13 +384,13 @@ impl TryoutService {
 
         let session = self
             .sessions
-            .find_by_id(session_id)
+            .find_by_id(session_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("session {session_id} not found")))?;
 
         if !bypass_premium_check
             && session.is_premium
-            && !self.access.has_access_to_tryout_session(actor.user_id, session_id).await?
+            && !self.access.has_access_to_tryout_session(actor.user_id, session_id, &actor.tenant).await?
         {
             return Err(AppError::Forbidden(
                 "sesi ini khusus siswa dengan akses premium (voucher pribadi atau paket sekolah aktif)".to_string(),
@@ -399,7 +401,7 @@ impl TryoutService {
         // the premium check above, so it applies even when `bypass_premium_check` is set (a
         // Simulasi UTBK slot could in principle also be an elective session). See
         // `ElectiveService::assert_can_start` doc comment.
-        self.electives.assert_can_start(actor.user_id, &session).await?;
+        self.electives.assert_can_start(actor.user_id, &session, &actor.tenant).await?;
 
         // Resume instead of duplicating: a student who already has an in-progress attempt for
         // this exact session (closed the tab, refreshed, clicked "Mulai"/"Ulangi" again) gets
@@ -410,12 +412,12 @@ impl TryoutService {
         // already-owned attempt is always safe.
         let existing_in_progress = self
             .attempts
-            .list_by_student(actor.user_id)
+            .list_by_student(actor.user_id, &actor.tenant)
             .await?
             .into_iter()
             .find(|a| a.session_id == session_id && a.status == crate::domain::tryout::AttemptStatus::InProgress);
         if let Some(attempt) = existing_in_progress {
-            let questions = self.load_playable_questions(attempt.id).await?;
+            let questions = self.load_playable_questions(attempt.id, &actor.tenant).await?;
             return Ok(AttemptWithQuestions { attempt, questions });
         }
 
@@ -426,7 +428,7 @@ impl TryoutService {
         // completely unchanged.
         let questions = if let Some(set_id) = session.question_set_id {
             self.question_sets
-                .approved_items_for_session(set_id, session.session_type)
+                .approved_items_for_session(set_id, session.session_type, &actor.tenant)
                 .await?
             // NOTE: do NOT sort_by_key(|q| q.id) here — a fixed set's curated order must
             // be preserved, unlike the random path below.
@@ -444,6 +446,7 @@ impl TryoutService {
                     difficulty,
                     session.question_count as i64,
                     session.session_type,
+                    &actor.tenant,
                 )
                 .await?;
             random.sort_by_key(|q| q.id); // deterministic-ish ordering after the random SELECT
@@ -464,7 +467,7 @@ impl TryoutService {
                 student_id: actor.user_id,
                 duration_minutes: session.duration_minutes,
                 question_ids: questions.iter().map(|q| q.id).collect(),
-            })
+            }, &actor.tenant)
             .await?;
 
         let playable = questions.iter().map(PlayableQuestion::from).collect();
@@ -485,7 +488,7 @@ impl TryoutService {
             return Err(AppError::Validation("attempt has already been submitted".to_string()));
         }
         self.attempts
-            .upsert_answer(attempt_id, question_id, answer_text, flagged)
+            .upsert_answer(attempt_id, question_id, answer_text, flagged, &actor.tenant)
             .await?;
         Ok(())
     }
@@ -504,11 +507,11 @@ impl TryoutService {
             // already succeeded — confusing the student into thinking something failed when
             // their attempt was actually already safely scored. Hand back the same
             // already-computed result instead.
-            return self.build_result_for_submitted(attempt).await;
+            return self.build_result_for_submitted(attempt, &actor.tenant).await;
         }
 
-        let question_ids = self.attempts.question_ids_for_attempt(attempt_id).await?;
-        let answers = self.attempts.answers_for_attempt(attempt_id).await?;
+        let question_ids = self.attempts.question_ids_for_attempt(attempt_id, &actor.tenant).await?;
+        let answers = self.attempts.answers_for_attempt(attempt_id, &actor.tenant).await?;
         let answer_by_question: HashMap<Uuid, &crate::domain::tryout::AttemptAnswer> =
             answers.iter().map(|a| (a.question_id, a)).collect();
 
@@ -521,7 +524,7 @@ impl TryoutService {
         for qid in &question_ids {
             let question = self
                 .questions
-                .find_by_id(*qid)
+                .find_by_id(*qid, &actor.tenant)
                 .await?
                 .ok_or_else(|| AppError::Internal(anyhow::anyhow!("question {qid} vanished from bank")))?;
 
@@ -544,7 +547,7 @@ impl TryoutService {
                     None => unanswered += 1,
                     Some(text) => {
                         let is_correct = normalize(text) == normalize(&question.correct_answer);
-                        self.attempts.grade_answer(ans.id, is_correct).await?;
+                        self.attempts.grade_answer(ans.id, is_correct, &actor.tenant).await?;
                         if is_correct {
                             correct += 1;
                             entry.0 += 1;
@@ -570,13 +573,14 @@ impl TryoutService {
                     unanswered_count: score.unanswered_count,
                     time_used_seconds,
                 },
+                &actor.tenant,
             )
             .await?;
 
         // Rebuild via the shared read path (re-reads the answers/is_correct just graded above)
         // so score_display_mode + irt_score are computed exactly once, in exactly one place —
         // same as the idempotent duplicate-submit branch above.
-        self.build_result_for_submitted(attempt).await
+        self.build_result_for_submitted(attempt, &actor.tenant).await
     }
 
     /// Public, ownership-checked entry point for "Lihat Hasil" — re-fetches the score +
@@ -589,7 +593,7 @@ impl TryoutService {
         if attempt.status != crate::domain::tryout::AttemptStatus::Submitted {
             return Err(AppError::Validation("hasil hanya tersedia setelah attempt disubmit".to_string()));
         }
-        self.build_result_for_submitted(attempt).await
+        self.build_result_for_submitted(attempt, &actor.tenant).await
     }
 
     /// Same computation as `get_result`, but with NO ownership check on `attempt` — the caller
@@ -598,16 +602,16 @@ impl TryoutService {
     /// belongs to a student on the caller's own school roster). Kept separate from
     /// `get_result` rather than adding a bypass flag there, so the ownership-checked path stays
     /// impossible to accidentally skip.
-    pub async fn result_for_submitted_attempt(&self, attempt_id: Uuid) -> AppResult<AttemptResult> {
+    pub async fn result_for_submitted_attempt(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<AttemptResult> {
         let attempt = self
             .attempts
-            .find_by_id(attempt_id)
+            .find_by_id(attempt_id, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("attempt {attempt_id} not found")))?;
         if attempt.status != crate::domain::tryout::AttemptStatus::Submitted {
             return Err(AppError::Validation("hasil hanya tersedia setelah attempt disubmit".to_string()));
         }
-        self.build_result_for_submitted(attempt).await
+        self.build_result_for_submitted(attempt, ctx).await
     }
 
     /// Rebuilds the subject breakdown for an ALREADY-submitted attempt purely by reading its
@@ -615,9 +619,9 @@ impl TryoutService {
     /// `submit_attempt` above) — never re-grades or re-writes anything. Used by
     /// `submit_attempt`'s idempotent branch so a duplicate submit is a safe no-op read, not a
     /// second grading pass, and by `get_result`/`result_for_submitted_attempt` above.
-    async fn build_result_for_submitted(&self, attempt: Attempt) -> AppResult<AttemptResult> {
-        let question_ids = self.attempts.question_ids_for_attempt(attempt.id).await?;
-        let answers = self.attempts.answers_for_attempt(attempt.id).await?;
+    async fn build_result_for_submitted(&self, attempt: Attempt, ctx: &TenantCtx) -> AppResult<AttemptResult> {
+        let question_ids = self.attempts.question_ids_for_attempt(attempt.id, ctx).await?;
+        let answers = self.attempts.answers_for_attempt(attempt.id, ctx).await?;
         let answer_by_question: HashMap<Uuid, &crate::domain::tryout::AttemptAnswer> =
             answers.iter().map(|a| (a.question_id, a)).collect();
 
@@ -629,7 +633,7 @@ impl TryoutService {
         for qid in &question_ids {
             let question = self
                 .questions
-                .find_by_id(*qid)
+                .find_by_id(*qid, ctx)
                 .await?
                 .ok_or_else(|| AppError::Internal(anyhow::anyhow!("question {qid} vanished from bank")))?;
             if matches!(question.question_type, QuestionType::Essay) {
@@ -661,7 +665,7 @@ impl TryoutService {
 
     pub async fn list_my_attempts(&self, actor: &AuthUser) -> AppResult<Vec<Attempt>> {
         actor.require_role(&[Role::Student])?;
-        self.attempts.list_by_student(actor.user_id).await
+        self.attempts.list_by_student(actor.user_id, &actor.tenant).await
     }
 
     /// Admin-only: every attempt for `student_id`, including `in_progress` ones — the only way
@@ -671,7 +675,7 @@ impl TryoutService {
     /// (School-only, same shape of need) but platform-wide instead of school-scoped.
     pub async fn admin_list_attempts(&self, actor: &AuthUser, student_id: Uuid) -> AppResult<Vec<Attempt>> {
         actor.require_role(&[Role::Admin])?;
-        self.attempts.list_by_student(student_id).await
+        self.attempts.list_by_student(student_id, &actor.tenant).await
     }
 
     pub async fn get_review(&self, actor: &AuthUser, attempt_id: Uuid) -> AppResult<Vec<ReviewItem>> {
@@ -681,17 +685,17 @@ impl TryoutService {
                 "review is only available after the attempt is submitted".to_string(),
             ));
         }
-        self.build_review(attempt_id).await
+        self.build_review(attempt_id, &actor.tenant).await
     }
 
     /// Same as `get_review`, but with NO ownership check — see
     /// `result_for_submitted_attempt`'s doc comment for why this exists as a separate method
     /// rather than a bypass flag on `get_review`. Used by
     /// `SchoolRationalizationService::student_attempt_review`.
-    pub async fn review_for_submitted_attempt(&self, attempt_id: Uuid) -> AppResult<Vec<ReviewItem>> {
+    pub async fn review_for_submitted_attempt(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<ReviewItem>> {
         let attempt = self
             .attempts
-            .find_by_id(attempt_id)
+            .find_by_id(attempt_id, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("attempt {attempt_id} not found")))?;
         if attempt.status != crate::domain::tryout::AttemptStatus::Submitted {
@@ -699,12 +703,12 @@ impl TryoutService {
                 "review is only available after the attempt is submitted".to_string(),
             ));
         }
-        self.build_review(attempt_id).await
+        self.build_review(attempt_id, ctx).await
     }
 
-    async fn build_review(&self, attempt_id: Uuid) -> AppResult<Vec<ReviewItem>> {
-        let question_ids = self.attempts.question_ids_for_attempt(attempt_id).await?;
-        let answers = self.attempts.answers_for_attempt(attempt_id).await?;
+    async fn build_review(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<ReviewItem>> {
+        let question_ids = self.attempts.question_ids_for_attempt(attempt_id, ctx).await?;
+        let answers = self.attempts.answers_for_attempt(attempt_id, ctx).await?;
         let answer_by_question: HashMap<Uuid, &crate::domain::tryout::AttemptAnswer> =
             answers.iter().map(|a| (a.question_id, a)).collect();
 
@@ -712,7 +716,7 @@ impl TryoutService {
         for qid in question_ids {
             let question = self
                 .questions
-                .find_by_id(qid)
+                .find_by_id(qid, ctx)
                 .await?
                 .ok_or_else(|| AppError::Internal(anyhow::anyhow!("question {qid} vanished from bank")))?;
             let ans = answer_by_question.get(&qid);
@@ -726,13 +730,13 @@ impl TryoutService {
         Ok(items)
     }
 
-    async fn load_playable_questions(&self, attempt_id: Uuid) -> AppResult<Vec<PlayableQuestion>> {
-        let question_ids = self.attempts.question_ids_for_attempt(attempt_id).await?;
+    async fn load_playable_questions(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<PlayableQuestion>> {
+        let question_ids = self.attempts.question_ids_for_attempt(attempt_id, ctx).await?;
         let mut playable = Vec::with_capacity(question_ids.len());
         for qid in question_ids {
             let question = self
                 .questions
-                .find_by_id(qid)
+                .find_by_id(qid, ctx)
                 .await?
                 .ok_or_else(|| AppError::Internal(anyhow::anyhow!("question {qid} vanished from bank")))?;
             playable.push(PlayableQuestion::from(&question));
@@ -750,8 +754,8 @@ impl TryoutService {
         if attempt.status != crate::domain::tryout::AttemptStatus::InProgress {
             return Err(AppError::Validation("attempt sudah disubmit".to_string()));
         }
-        let questions = self.load_playable_questions(attempt.id).await?;
-        let answers = self.attempts.answers_for_attempt(attempt.id).await?;
+        let questions = self.load_playable_questions(attempt.id, &actor.tenant).await?;
+        let answers = self.attempts.answers_for_attempt(attempt.id, &actor.tenant).await?;
         Ok(AttemptResume { attempt, questions, answers })
     }
 
@@ -768,13 +772,13 @@ impl TryoutService {
         if attempt.status != crate::domain::tryout::AttemptStatus::InProgress {
             return Err(AppError::Validation("attempt sudah disubmit".to_string()));
         }
-        self.load_playable_questions(attempt.id).await
+        self.load_playable_questions(attempt.id, &actor.tenant).await
     }
 
     async fn get_owned_attempt(&self, actor: &AuthUser, attempt_id: Uuid) -> AppResult<Attempt> {
         let attempt = self
             .attempts
-            .find_by_id(attempt_id)
+            .find_by_id(attempt_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("attempt {attempt_id} not found")))?;
         if attempt.student_id != actor.user_id && actor.role != Role::Admin {

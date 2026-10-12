@@ -78,7 +78,7 @@ impl SchoolPortalService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
 
         let mut total_score: i64 = 0;
@@ -87,7 +87,7 @@ impl SchoolPortalService {
         let mut target_count: i64 = 0;
 
         for student in &students {
-            let attempts = self.attempts.list_by_student(student.id).await?;
+            let attempts = self.attempts.list_by_student(student.id, &actor.tenant).await?;
             for a in attempts {
                 if a.status == AttemptStatus::Submitted {
                     tryouts_completed += 1;
@@ -97,7 +97,7 @@ impl SchoolPortalService {
                     }
                 }
             }
-            let targets = self.ptn_targets.list_by_student(student.id).await?;
+            let targets = self.ptn_targets.list_by_student(student.id, &actor.tenant).await?;
             target_count += targets.len() as i64;
         }
 
@@ -116,12 +116,12 @@ impl SchoolPortalService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
 
         let mut out = Vec::with_capacity(students.len());
         for student in &students {
-            let attempts = self.attempts.list_by_student(student.id).await?;
+            let attempts = self.attempts.list_by_student(student.id, &actor.tenant).await?;
             let mut best_score: Option<i32> = None;
             let mut total_score: i64 = 0;
             let mut score_count: i64 = 0;
@@ -140,7 +140,7 @@ impl SchoolPortalService {
                     }
                 }
             }
-            let targets = self.ptn_targets.list_by_student(student.id).await?;
+            let targets = self.ptn_targets.list_by_student(student.id, &actor.tenant).await?;
             out.push(StudentRosterStat {
                 student_id: student.id,
                 best_score,
@@ -160,12 +160,12 @@ impl SchoolPortalService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
 
         let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         for student in &students {
-            let targets = self.ptn_targets.list_by_student(student.id).await?;
+            let targets = self.ptn_targets.list_by_student(student.id, &actor.tenant).await?;
             for t in targets {
                 if let Some(program) = self.programs.find_by_id(t.ptn_program_id).await? {
                     *counts.entry(program.nama_ptn).or_insert(0) += 1;
@@ -188,12 +188,12 @@ impl SchoolPortalService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
 
         let mut out = Vec::new();
         for student in &students {
-            let attempts = self.attempts.list_by_student(student.id).await?;
+            let attempts = self.attempts.list_by_student(student.id, &actor.tenant).await?;
             for a in attempts {
                 if a.status == AttemptStatus::Submitted {
                     if let Some(submitted_at) = a.submitted_at {
@@ -222,7 +222,7 @@ impl SchoolPortalService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let student = self
             .users
-            .find_by_id(student_id)
+            .find_by_id(student_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("student {student_id} not found")))?;
         if student.role != Role::Student || student.school_id != Some(school_id) {
@@ -234,7 +234,7 @@ impl SchoolPortalService {
     async fn resolve_own_school_id(&self, actor: &AuthUser) -> AppResult<uuid::Uuid> {
         let me = self
             .users
-            .find_by_id(actor.user_id)
+            .find_by_id(actor.user_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Unauthorized("akun tidak ditemukan".to_string()))?;
         me.school_id

@@ -33,6 +33,7 @@ use crate::domain::report::{Report, ReportPayload, ReportType};
 use crate::domain::school::{PackageType, School, SchoolStatus, SchoolType};
 use crate::domain::simulation::{SimulationRun, SimulationRunStatus, SimulationTemplate, TemplateCompletionStats};
 use crate::domain::taxonomy::{CategoryWithSubjects, Subject, SubjectCategory};
+use crate::domain::tenant::TenantCtx;
 use crate::domain::tryout::{Attempt, AttemptAnswer, SessionType, TryoutSession};
 use crate::domain::user::{Role, User, UserStatus};
 use crate::domain::voucher::{DiscountType, Voucher, VoucherType};
@@ -94,23 +95,40 @@ pub struct UserUpdate {
     pub password_hash: Option<String>,
 }
 
+// Every method takes `ctx: &TenantCtx` — it's what lets the Postgres implementation
+// `set_config('app.tenant_id', ...)`/`set_config('app.is_platform_admin', ...)` on its
+// transaction before touching `core.akun`/`ptn.student_profile` (both RLS-protected).
+// Callers already have this on hand: every service method already takes `actor: &AuthUser`
+// and just forwards `&actor.tenant`. `create`/`find_by_email` are the two exceptions:
+//  - `find_by_email` genuinely has no tenant yet (that's what it's resolving) — goes
+//    through the BYPASSRLS lookup pool instead.
+//  - `create` takes no `ctx` because the RIGHT tenant for a new account depends on the
+//    new account's OWN role/school_id, not on the actor creating it — e.g. a
+//    platform-scoped Admin creating a School account needs that school's tenant, not the
+//    admin's own platform tenant. The Postgres impl resolves `new_user.school_id ->
+//    core.tenant.id` itself before setting the GUC (`core.tenant` itself carries no RLS
+//    policy, so this is safe to do with no tenant context set yet).
 #[async_trait]
 pub trait UserRepository: Send + Sync {
     async fn create(&self, new_user: NewUser) -> AppResult<User>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<User>>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<User>>;
+    /// No `ctx` — this is the pre-authentication lookup (we don't know the caller's tenant
+    /// yet, that's exactly what this resolves), so the Postgres impl runs it through the
+    /// BYPASSRLS lookup pool, not the regular RLS-scoped one. Only `AuthService::login`/
+    /// `register`'s uniqueness check should ever call this.
     async fn find_by_email(&self, email: &str) -> AppResult<Option<User>>;
-    async fn list(&self, filter: UserFilter) -> AppResult<Vec<User>>;
-    async fn update(&self, id: Uuid, update: UserUpdate) -> AppResult<Option<User>>;
+    async fn list(&self, filter: UserFilter, ctx: &TenantCtx) -> AppResult<Vec<User>>;
+    async fn update(&self, id: Uuid, update: UserUpdate, ctx: &TenantCtx) -> AppResult<Option<User>>;
     /// `Ok(false)` if the row didn't exist; a foreign-key conflict (user still owns
     /// questions/sessions) surfaces as `AppError::Conflict`, not a generic 500.
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
-    async fn set_status(&self, id: Uuid, status: UserStatus) -> AppResult<Option<User>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
+    async fn set_status(&self, id: Uuid, status: UserStatus, ctx: &TenantCtx) -> AppResult<Option<User>>;
     /// Called by `AuthService::login` on every successful login — real activity, never faked.
-    async fn touch_last_login(&self, id: Uuid) -> AppResult<()>;
+    async fn touch_last_login(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<()>;
     /// Sets (or clears, with `None`) the user's profile photo URL. Kept separate from the
     /// full `update()` (which requires every field) since this is a single, frequent,
     /// self-service action.
-    async fn update_avatar(&self, id: Uuid, avatar_url: Option<String>) -> AppResult<Option<User>>;
+    async fn update_avatar(&self, id: Uuid, avatar_url: Option<String>, ctx: &TenantCtx) -> AppResult<Option<User>>;
 }
 
 // ─── Schools ────────────────────────────────────────────────────────────────────
@@ -157,29 +175,37 @@ pub trait SchoolRepository: Send + Sync {
 // ─── Analytics (read-only aggregations — no CRUD) ──────────────────────────────
 
 #[async_trait]
+// Every method takes `ctx: &TenantCtx` (needed to set the RLS GUC before touching
+// `ptn.questions`/`ptn.attempts`/`ptn.attempt_answers`). The platform-wide methods
+// (`summary`, `score_trend`, `subject_breakdown`, `question_status_distribution`,
+// `top_schools`, `score_trend_by_year`) are always admin-only cross-tenant aggregates —
+// callers should always pass `TenantCtx::platform_admin()`. The `_for_school`/
+// `_for_student` variants are scoped to one tenant — callers pass the actor's own
+// `&actor.tenant`.
+#[async_trait]
 pub trait AnalyticsRepository: Send + Sync {
-    async fn summary(&self) -> AppResult<AnalyticsSummary>;
-    async fn score_trend(&self, days: i32) -> AppResult<Vec<ScoreTrendPoint>>;
-    async fn subject_breakdown(&self) -> AppResult<Vec<SubjectAccuracy>>;
-    async fn question_status_distribution(&self) -> AppResult<Vec<QuestionStatusCount>>;
-    async fn top_schools(&self, limit: i64) -> AppResult<Vec<SchoolRanking>>;
+    async fn summary(&self, ctx: &TenantCtx) -> AppResult<AnalyticsSummary>;
+    async fn score_trend(&self, days: i32, ctx: &TenantCtx) -> AppResult<Vec<ScoreTrendPoint>>;
+    async fn subject_breakdown(&self, ctx: &TenantCtx) -> AppResult<Vec<SubjectAccuracy>>;
+    async fn question_status_distribution(&self, ctx: &TenantCtx) -> AppResult<Vec<QuestionStatusCount>>;
+    async fn top_schools(&self, limit: i64, ctx: &TenantCtx) -> AppResult<Vec<SchoolRanking>>;
     /// Platform-wide "Perbandingan Tahun" — attempts bucketed by calendar year of
     /// `submitted_at`. See `domain::analytics::YearlyPerformancePoint` doc comment.
-    async fn score_trend_by_year(&self) -> AppResult<Vec<YearlyPerformancePoint>>;
+    async fn score_trend_by_year(&self, ctx: &TenantCtx) -> AppResult<Vec<YearlyPerformancePoint>>;
     /// School-portal-scoped variants — same aggregation logic as the admin-wide versions,
-    /// but joined through `users.school_id` so a school PIC only ever sees their own
+    /// but joined through `core.akun.tenant_id` so a school PIC only ever sees their own
     /// students' real data.
-    async fn subject_breakdown_for_school(&self, school_id: Uuid) -> AppResult<Vec<SubjectAccuracy>>;
-    async fn score_trend_for_school(&self, school_id: Uuid, days: i32) -> AppResult<Vec<ScoreTrendPoint>>;
-    async fn score_trend_by_year_for_school(&self, school_id: Uuid) -> AppResult<Vec<YearlyPerformancePoint>>;
-    async fn student_ranking_for_school(&self, school_id: Uuid) -> AppResult<Vec<StudentRanking>>;
+    async fn subject_breakdown_for_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<SubjectAccuracy>>;
+    async fn score_trend_for_school(&self, school_id: Uuid, days: i32, ctx: &TenantCtx) -> AppResult<Vec<ScoreTrendPoint>>;
+    async fn score_trend_by_year_for_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<YearlyPerformancePoint>>;
+    async fn student_ranking_for_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<StudentRanking>>;
     /// School portal's "Analytics & Insights" drill-down — see `domain::analytics::StudentActivity`
     /// doc comment for why this is a separate query from `student_ranking_for_school` (LEFT JOIN,
     /// includes students with zero submitted attempts, plus `rombel_code`/`last_attempt_at`).
-    async fn student_activity_for_school(&self, school_id: Uuid) -> AppResult<Vec<StudentActivity>>;
+    async fn student_activity_for_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<StudentActivity>>;
     /// Student portal's own "Overview" mastery breakdown — same accuracy aggregation,
     /// scoped to just this one student's real answers.
-    async fn subject_breakdown_for_student(&self, student_id: Uuid) -> AppResult<Vec<SubjectAccuracy>>;
+    async fn subject_breakdown_for_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<SubjectAccuracy>>;
 }
 
 // ─── Questions ──────────────────────────────────────────────────────────────────
@@ -231,24 +257,28 @@ pub struct QuestionUpdate {
     pub time_limit: Option<i32>,
 }
 
+// Every method takes `ctx: &TenantCtx` — see `UserRepository`'s doc comment above for why
+// (`ptn.questions` carries RLS; the Postgres impl sets the GUCs on its transaction before
+// touching it). Callers already have `actor: &AuthUser` in scope and just forward `&actor.tenant`.
 #[async_trait]
 pub trait QuestionRepository: Send + Sync {
-    async fn create(&self, new_question: NewQuestion) -> AppResult<Question>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Question>>;
-    async fn list(&self, filter: QuestionFilter) -> AppResult<(Vec<Question>, i64)>;
-    async fn update(&self, id: Uuid, update: QuestionUpdate) -> AppResult<Option<Question>>;
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn create(&self, new_question: NewQuestion, ctx: &TenantCtx) -> AppResult<Question>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Question>>;
+    async fn list(&self, filter: QuestionFilter, ctx: &TenantCtx) -> AppResult<(Vec<Question>, i64)>;
+    async fn update(&self, id: Uuid, update: QuestionUpdate, ctx: &TenantCtx) -> AppResult<Option<Question>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     async fn set_review_status(
         &self,
         id: Uuid,
         status: QuestionStatus,
         review_note: Option<String>,
         reviewed_by: Uuid,
+        ctx: &TenantCtx,
     ) -> AppResult<Option<Question>>;
     /// Move a question into the review queue and clear any previous review verdict
     /// (note/reviewed_by/reviewed_at) — used for both first-time "Kirim Review" (from draft)
     /// and "Ajukan Ulang" (from rejected/revision, after addressing feedback).
-    async fn resubmit(&self, id: Uuid) -> AppResult<Option<Question>>;
+    async fn resubmit(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Question>>;
     /// Random sample of approved questions matching optional subject/topic/difficulty
     /// filters — used to build a tryout/drilling attempt. `session_type` gates the `essay`
     /// question type: essay is self-check/Drilling-only (never auto-graded, see
@@ -260,6 +290,7 @@ pub trait QuestionRepository: Send + Sync {
         difficulty: Option<Difficulty>,
         count: i64,
         session_type: SessionType,
+        ctx: &TenantCtx,
     ) -> AppResult<Vec<Question>>;
 }
 
@@ -306,41 +337,44 @@ pub struct SessionUpdate {
 
 #[async_trait]
 pub trait TryoutSessionRepository: Send + Sync {
-    async fn create(&self, new_session: NewSession) -> AppResult<TryoutSession>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<TryoutSession>>;
-    async fn list(&self, session_type: Option<SessionType>) -> AppResult<Vec<TryoutSession>>;
-    async fn update(&self, id: Uuid, update: SessionUpdate) -> AppResult<Option<TryoutSession>>;
+    async fn create(&self, new_session: NewSession, ctx: &TenantCtx) -> AppResult<TryoutSession>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<TryoutSession>>;
+    async fn list(&self, session_type: Option<SessionType>, ctx: &TenantCtx) -> AppResult<Vec<TryoutSession>>;
+    async fn update(&self, id: Uuid, update: SessionUpdate, ctx: &TenantCtx) -> AppResult<Option<TryoutSession>>;
     /// `Ok(false)` if the row didn't exist; fails with `AppError::Conflict` if attempts
     /// already reference this session (they must be preserved for audit/history).
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Cheap targeted toggle — used by `PackageService::set_active`'s publish cascade and by
     /// an owner (Admin, or Content for their own session) manually flipping draft status.
-    async fn set_draft(&self, id: Uuid, is_draft: bool) -> AppResult<Option<TryoutSession>>;
+    async fn set_draft(&self, id: Uuid, is_draft: bool, ctx: &TenantCtx) -> AppResult<Option<TryoutSession>>;
 }
 
 // ─── Question Sets ("Set Soal") ─────────────────────────────────────────────────
 
+// Every method takes `ctx: &TenantCtx` — `ptn.question_sets` carries RLS (`ptn.question_set_items`
+// does not — see that table's doc comment in the migration — but it's only ever reached by
+// joining through `ptn.question_sets`, so the same transaction/GUC still has to be set first).
 #[async_trait]
 pub trait QuestionSetRepository: Send + Sync {
-    async fn create(&self, name: String, description: String, created_by: Uuid) -> AppResult<QuestionSet>;
+    async fn create(&self, name: String, description: String, created_by: Uuid, ctx: &TenantCtx) -> AppResult<QuestionSet>;
     /// Includes `item_count` (live `COUNT` join), for list views.
-    async fn list(&self) -> AppResult<Vec<QuestionSet>>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<QuestionSet>>;
-    async fn update(&self, id: Uuid, name: String, description: String) -> AppResult<Option<QuestionSet>>;
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<QuestionSet>>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<QuestionSet>>;
+    async fn update(&self, id: Uuid, name: String, description: String, ctx: &TenantCtx) -> AppResult<Option<QuestionSet>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Full Question rows (not just ids), in `sort_order` order.
-    async fn list_items(&self, set_id: Uuid) -> AppResult<Vec<Question>>;
+    async fn list_items(&self, set_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Question>>;
     /// Upsert-style: adding a question already in the set is a no-op success (idempotent),
     /// not an error — this matters because the question authoring form calls this on every
     /// save of a question that has a set assigned, including re-saves of an
     /// already-assigned question.
-    async fn add_item(&self, set_id: Uuid, question_id: Uuid, sort_order: i32) -> AppResult<()>;
-    async fn remove_item(&self, set_id: Uuid, question_id: Uuid) -> AppResult<bool>;
+    async fn add_item(&self, set_id: Uuid, question_id: Uuid, sort_order: i32, ctx: &TenantCtx) -> AppResult<()>;
+    async fn remove_item(&self, set_id: Uuid, question_id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Same governance/type filtering `random_approved` applies (status='approved', and
     /// `essay` type excluded unless `session_type` is Drilling) but over this specific set's
     /// members instead of the whole bank, preserving `sort_order` (does NOT re-sort by id
     /// like the random path does — a curated set's order is intentional).
-    async fn approved_items_for_session(&self, set_id: Uuid, session_type: SessionType) -> AppResult<Vec<Question>>;
+    async fn approved_items_for_session(&self, set_id: Uuid, session_type: SessionType, ctx: &TenantCtx) -> AppResult<Vec<Question>>;
 }
 
 // ─── Events (Manajemen Event) ──────────────────────────────────────────────────
@@ -375,16 +409,16 @@ pub struct EventUpdate {
 
 #[async_trait]
 pub trait EventRepository: Send + Sync {
-    async fn create(&self, new_event: NewEvent) -> AppResult<Event>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Event>>;
-    async fn list(&self) -> AppResult<Vec<Event>>;
-    async fn update(&self, id: Uuid, update: EventUpdate) -> AppResult<Option<Event>>;
+    async fn create(&self, new_event: NewEvent, ctx: &TenantCtx) -> AppResult<Event>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Event>>;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<Event>>;
+    async fn update(&self, id: Uuid, update: EventUpdate, ctx: &TenantCtx) -> AppResult<Option<Event>>;
     /// Cheap targeted update for the quick lifecycle actions (Publish/Mulai/Selesaikan/
     /// Arsipkan) so callers don't need to resend the full form payload just to flip status.
-    async fn set_status(&self, id: Uuid, status: EventStatus) -> AppResult<Option<Event>>;
+    async fn set_status(&self, id: Uuid, status: EventStatus, ctx: &TenantCtx) -> AppResult<Option<Event>>;
     /// `Ok(false)` if the row didn't exist. Events never block on FK conflicts from
     /// `attempts` — those belong to the underlying session, not the event row itself.
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
 }
 
 // ─── Admission Deadlines (Kalender Deadline SNBP/SNBT/UTBK) ────────────────────
@@ -408,12 +442,15 @@ pub struct AdmissionDeadlineUpdate {
 
 #[async_trait]
 pub trait AdmissionDeadlineRepository: Send + Sync {
-    async fn create(&self, new_deadline: NewAdmissionDeadline) -> AppResult<AdmissionDeadline>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<AdmissionDeadline>>;
-    /// Full admin CRUD list, newest deadline first.
-    async fn list(&self) -> AppResult<Vec<AdmissionDeadline>>;
-    async fn update(&self, id: Uuid, update: AdmissionDeadlineUpdate) -> AppResult<Option<AdmissionDeadline>>;
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn create(&self, new_deadline: NewAdmissionDeadline, ctx: &TenantCtx) -> AppResult<AdmissionDeadline>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<AdmissionDeadline>>;
+    /// Full admin CRUD list, newest deadline first. Also read by School/Student for the
+    /// "Deadline Mendatang" countdown widget — always called with `TenantCtx::platform_admin()`
+    /// regardless of caller role, since deadlines are genuinely platform-wide (SNBP/SNBT/UTBK
+    /// calendar), not per-school data.
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<AdmissionDeadline>>;
+    async fn update(&self, id: Uuid, update: AdmissionDeadlineUpdate, ctx: &TenantCtx) -> AppResult<Option<AdmissionDeadline>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
 }
 
 pub struct NewAttempt {
@@ -443,27 +480,30 @@ pub struct ItemResponseStat {
 
 #[async_trait]
 pub trait AttemptRepository: Send + Sync {
-    async fn create(&self, new_attempt: NewAttempt) -> AppResult<Attempt>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Attempt>>;
-    async fn list_by_student(&self, student_id: Uuid) -> AppResult<Vec<Attempt>>;
+    async fn create(&self, new_attempt: NewAttempt, ctx: &TenantCtx) -> AppResult<Attempt>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Attempt>>;
+    async fn list_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Attempt>>;
     /// Ordered list of question ids assigned to this attempt.
-    async fn question_ids_for_attempt(&self, attempt_id: Uuid) -> AppResult<Vec<Uuid>>;
+    async fn question_ids_for_attempt(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Uuid>>;
     async fn upsert_answer(
         &self,
         attempt_id: Uuid,
         question_id: Uuid,
         answer_text: Option<String>,
         flagged: bool,
+        ctx: &TenantCtx,
     ) -> AppResult<AttemptAnswer>;
-    async fn answers_for_attempt(&self, attempt_id: Uuid) -> AppResult<Vec<AttemptAnswer>>;
-    async fn submit(&self, attempt_id: Uuid, submission: AttemptSubmission) -> AppResult<Attempt>;
+    async fn answers_for_attempt(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<AttemptAnswer>>;
+    async fn submit(&self, attempt_id: Uuid, submission: AttemptSubmission, ctx: &TenantCtx) -> AppResult<Attempt>;
     /// Persist correctness for each answer once graded (called during submit).
-    async fn grade_answer(&self, answer_id: Uuid, is_correct: bool) -> AppResult<()>;
+    async fn grade_answer(&self, answer_id: Uuid, is_correct: bool, ctx: &TenantCtx) -> AppResult<()>;
     /// Platform-wide correct/total counts per question, from every graded `attempt_answers` row
     /// (`is_correct IS NOT NULL`) ever recorded — feeds `IrtService::recalibrate`'s item
     /// difficulty calibration. A question with zero graded answers simply doesn't appear in the
-    /// result (honest-zero: no fabricated `ItemResponseStat { total: 0, .. }` rows).
-    async fn item_response_stats(&self) -> AppResult<Vec<ItemResponseStat>>;
+    /// result (honest-zero: no fabricated `ItemResponseStat { total: 0, .. }` rows). Always
+    /// called with `TenantCtx::platform_admin()` (see `IrtService::recalibrate`) since this
+    /// is a genuinely platform-wide aggregate, not scoped to one school.
+    async fn item_response_stats(&self, ctx: &TenantCtx) -> AppResult<Vec<ItemResponseStat>>;
 }
 
 // ─── Packages (Manajemen Paket) ────────────────────────────────────────────────
@@ -514,50 +554,58 @@ pub struct PackageUpdate {
     pub exam_track: ExamTrack,
 }
 
+// Every method takes `ctx: &TenantCtx` — `ptn.packages` carries RLS.
 #[async_trait]
 pub trait PackageRepository: Send + Sync {
-    async fn create(&self, new_package: NewPackage) -> AppResult<Package>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Package>>;
-    async fn list(&self) -> AppResult<Vec<Package>>;
-    async fn update(&self, id: Uuid, update: PackageUpdate) -> AppResult<Option<Package>>;
+    async fn create(&self, new_package: NewPackage, ctx: &TenantCtx) -> AppResult<Package>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Package>>;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<Package>>;
+    async fn update(&self, id: Uuid, update: PackageUpdate, ctx: &TenantCtx) -> AppResult<Option<Package>>;
     /// Cheap targeted toggle for the show/hide-on-landing-page quick action.
-    async fn set_active(&self, id: Uuid, active: bool) -> AppResult<Option<Package>>;
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn set_active(&self, id: Uuid, active: bool, ctx: &TenantCtx) -> AppResult<Option<Package>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
 }
 
 // ─── Package content scoping (which TryoutSessions/SimulationTemplates a Package unlocks) ──
+// `ptn.package_content_items` itself carries no `tenant_id`/RLS (see migration doc comment —
+// it's a pure join table reached only via `package_id`), but every method still takes
+// `ctx: &TenantCtx` because resolving `package_id`/`content_id` from their `public_id`s touches
+// `ptn.packages`/`ptn.tryout_sessions`/`ptn.simulation_templates`, which DO carry RLS.
 
 #[async_trait]
 pub trait PackageContentRepository: Send + Sync {
     /// Denormalizes `content_title` at read time via a join keyed on `content_type`.
-    async fn list_for_package(&self, package_id: Uuid) -> AppResult<Vec<PackageContentItem>>;
+    async fn list_for_package(&self, package_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<PackageContentItem>>;
     /// `Ok(Err(...))`-free — caller (`PackageService`) is responsible for validating that
     /// `content_id` actually exists in the right table before calling this; the repository
     /// trusts it. Idempotent: re-adding an already-assigned item is a no-op (unique constraint).
-    async fn add_item(&self, package_id: Uuid, content_type: PackageContentType, content_id: Uuid) -> AppResult<PackageContentItem>;
+    async fn add_item(&self, package_id: Uuid, content_type: PackageContentType, content_id: Uuid, ctx: &TenantCtx) -> AppResult<PackageContentItem>;
     /// `Ok(false)` if the row didn't exist.
-    async fn remove_item(&self, id: Uuid) -> AppResult<bool>;
+    async fn remove_item(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Every `package_id` that includes this exact `(content_type, content_id)` — the core
     /// lookup `AccessService` uses to answer "which packages would unlock this content".
-    async fn package_ids_for_content(&self, content_type: PackageContentType, content_id: Uuid) -> AppResult<Vec<Uuid>>;
+    async fn package_ids_for_content(&self, content_type: PackageContentType, content_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Uuid>>;
     /// Every `(content_type, content_id)` pair unlocked by ANY of the given `package_ids` —
     /// used by `AccessService::list_my_unlocked_content` to answer "what can this student play"
     /// in one query instead of one round-trip per content item.
-    async fn content_ids_for_packages(&self, package_ids: &[Uuid]) -> AppResult<Vec<(PackageContentType, Uuid)>>;
+    async fn content_ids_for_packages(&self, package_ids: &[Uuid], ctx: &TenantCtx) -> AppResult<Vec<(PackageContentType, Uuid)>>;
 }
 
 // ─── Package elective choices ("mapel pilihan" TKA-style subject selection) ───────
+// `ptn.package_elective_choices` itself carries no `tenant_id`/RLS (student_id/package_id/
+// session_id already scope it transitively), but `ctx` is still needed to resolve those
+// `public_id`s against `core.akun`/`ptn.packages`/`ptn.tryout_sessions` (all RLS-protected).
 
 #[async_trait]
 pub trait PackageElectiveRepository: Send + Sync {
     /// This student's CURRENT elective picks within this package — always reflects the latest
     /// `set_choices` call, not a history (see `ElectiveService` doc comment).
-    async fn list_choices(&self, student_id: Uuid, package_id: Uuid) -> AppResult<Vec<Uuid>>;
+    async fn list_choices(&self, student_id: Uuid, package_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Uuid>>;
     /// Full replace (delete-then-insert, in one transaction): `session_ids` becomes the
     /// student's entire pick set for this package, regardless of what was picked before.
     /// Passing an empty `Vec` clears all picks. Caller (`ElectiveService`) is responsible for
     /// validating count/membership before calling this; the repository trusts it.
-    async fn set_choices(&self, student_id: Uuid, package_id: Uuid, session_ids: Vec<Uuid>) -> AppResult<()>;
+    async fn set_choices(&self, student_id: Uuid, package_id: Uuid, session_ids: Vec<Uuid>, ctx: &TenantCtx) -> AppResult<()>;
 }
 
 // ─── Vouchers (Manajemen Voucher) ──────────────────────────────────────────────
@@ -579,31 +627,31 @@ pub struct NewVoucher {
 
 #[async_trait]
 pub trait VoucherRepository: Send + Sync {
-    async fn create(&self, new_voucher: NewVoucher) -> AppResult<Voucher>;
-    async fn create_batch(&self, new_vouchers: Vec<NewVoucher>) -> AppResult<Vec<Voucher>>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Voucher>>;
-    async fn find_by_code(&self, code: &str) -> AppResult<Option<Voucher>>;
-    async fn list(&self) -> AppResult<Vec<Voucher>>;
+    async fn create(&self, new_voucher: NewVoucher, ctx: &TenantCtx) -> AppResult<Voucher>;
+    async fn create_batch(&self, new_vouchers: Vec<NewVoucher>, ctx: &TenantCtx) -> AppResult<Vec<Voucher>>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Voucher>>;
+    async fn find_by_code(&self, code: &str, ctx: &TenantCtx) -> AppResult<Option<Voucher>>;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<Voucher>>;
     /// Cheap targeted toggle for the active/inactive quick action.
-    async fn set_active(&self, id: Uuid, active: bool) -> AppResult<Option<Voucher>>;
+    async fn set_active(&self, id: Uuid, active: bool, ctx: &TenantCtx) -> AppResult<Option<Voucher>>;
     /// `Ok(false)` if the row didn't exist. Callers (service layer) are responsible for
     /// refusing to delete a voucher that has already been used — enforced above the
     /// repository so it stays a pure business rule, not a DB-level constraint.
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Atomically records a `(voucher_id, student_id)` redemption row and increments
     /// `used_count` in one transaction. Returns `AppError::Conflict` if this student already
     /// redeemed this exact voucher (unique constraint on `voucher_redemptions`).
-    async fn redeem(&self, voucher_id: Uuid, student_id: Uuid) -> AppResult<Voucher>;
+    async fn redeem(&self, voucher_id: Uuid, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Voucher>;
     /// True if this student has EVER redeemed any voucher for any package — used as the
     /// individual-access half of `AccessService::has_premium_access`'s OR check. Does not
     /// distinguish which package; today every Package functionally means the same thing
     /// (premium tryout access), since there is no per-package content-scoping data yet.
-    async fn student_has_redemption(&self, student_id: Uuid) -> AppResult<bool>;
+    async fn student_has_redemption(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Distinct `package_id`s this student has ever redeemed a voucher for — the personal-
     /// ownership half of the per-package access check (see `AccessService::owned_package_ids`).
     /// Supersedes `student_has_redemption` for real gating now that access is package-scoped
     /// rather than all-or-nothing; that method is kept for any other boolean-only callers.
-    async fn student_redeemed_package_ids(&self, student_id: Uuid) -> AppResult<Vec<Uuid>>;
+    async fn student_redeemed_package_ids(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Uuid>>;
 }
 
 // ─── School Package Entitlements ───────────────────────────────────────────────
@@ -652,10 +700,10 @@ pub struct PointRuleUpdate {
 
 #[async_trait]
 pub trait PointRuleRepository: Send + Sync {
-    async fn create(&self, new_rule: NewPointRule) -> AppResult<PointRule>;
-    async fn list(&self) -> AppResult<Vec<PointRule>>;
-    async fn update(&self, id: Uuid, update: PointRuleUpdate) -> AppResult<Option<PointRule>>;
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn create(&self, new_rule: NewPointRule, ctx: &TenantCtx) -> AppResult<PointRule>;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<PointRule>>;
+    async fn update(&self, id: Uuid, update: PointRuleUpdate, ctx: &TenantCtx) -> AppResult<Option<PointRule>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
 }
 
 pub struct NewBadge {
@@ -687,19 +735,19 @@ pub struct BadgeUpdate {
 
 #[async_trait]
 pub trait BadgeRepository: Send + Sync {
-    async fn create(&self, new_badge: NewBadge) -> AppResult<Badge>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Badge>>;
-    async fn list(&self) -> AppResult<Vec<Badge>>;
-    async fn update(&self, id: Uuid, update: BadgeUpdate) -> AppResult<Option<Badge>>;
-    async fn set_active(&self, id: Uuid, active: bool) -> AppResult<Option<Badge>>;
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn create(&self, new_badge: NewBadge, ctx: &TenantCtx) -> AppResult<Badge>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Badge>>;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<Badge>>;
+    async fn update(&self, id: Uuid, update: BadgeUpdate, ctx: &TenantCtx) -> AppResult<Option<Badge>>;
+    async fn set_active(&self, id: Uuid, active: bool, ctx: &TenantCtx) -> AppResult<Option<Badge>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Live count of distinct students who currently satisfy this badge's condition,
     /// computed against real `attempts`/`attempt_answers` rows — never stored.
-    async fn earned_count(&self, condition_type: BadgeConditionType, condition_value: i32) -> AppResult<i64>;
-    async fn list_with_stats(&self) -> AppResult<Vec<BadgeWithStats>>;
+    async fn earned_count(&self, condition_type: BadgeConditionType, condition_value: i32, ctx: &TenantCtx) -> AppResult<i64>;
+    async fn list_with_stats(&self, ctx: &TenantCtx) -> AppResult<Vec<BadgeWithStats>>;
     /// One student's real progress toward every active badge — backs the student
     /// portal's "Achievements" card (see `StudentBadgeStatus`).
-    async fn list_for_student(&self, student_id: Uuid) -> AppResult<Vec<crate::domain::gamification::StudentBadgeStatus>>;
+    async fn list_for_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<crate::domain::gamification::StudentBadgeStatus>>;
 }
 
 pub struct NewChallenge {
@@ -727,16 +775,16 @@ pub struct ChallengeUpdate {
 
 #[async_trait]
 pub trait ChallengeRepository: Send + Sync {
-    async fn create(&self, new_challenge: NewChallenge) -> AppResult<Challenge>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Challenge>>;
-    async fn list(&self) -> AppResult<Vec<Challenge>>;
-    async fn update(&self, id: Uuid, update: ChallengeUpdate) -> AppResult<Option<Challenge>>;
-    async fn set_status(&self, id: Uuid, status: ChallengeStatus) -> AppResult<Option<Challenge>>;
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn create(&self, new_challenge: NewChallenge, ctx: &TenantCtx) -> AppResult<Challenge>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Challenge>>;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<Challenge>>;
+    async fn update(&self, id: Uuid, update: ChallengeUpdate, ctx: &TenantCtx) -> AppResult<Option<Challenge>>;
+    async fn set_status(&self, id: Uuid, status: ChallengeStatus, ctx: &TenantCtx) -> AppResult<Option<Challenge>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Live participants/completions for this challenge's date range + type, computed
     /// against real `attempts` rows — never stored.
-    async fn stats_for(&self, challenge: &Challenge) -> AppResult<(i64, i64)>;
-    async fn list_with_stats(&self) -> AppResult<Vec<ChallengeWithStats>>;
+    async fn stats_for(&self, challenge: &Challenge, ctx: &TenantCtx) -> AppResult<(i64, i64)>;
+    async fn list_with_stats(&self, ctx: &TenantCtx) -> AppResult<Vec<ChallengeWithStats>>;
 }
 
 /// Optional scoping for a leaderboard read — every field is applied live in SQL, never
@@ -754,11 +802,17 @@ pub trait LeaderboardRepository: Send + Sync {
     /// Top students ranked by their best-ever (or best-in-range) single-attempt score,
     /// joined with real school data and a real per-student streak — always computed live
     /// from `attempts`, never a stored/fake ranking.
-    async fn top_students(&self, params: LeaderboardParams) -> AppResult<Vec<LeaderboardEntry>>;
+    ///
+    /// Every `ptn.*` table this reads from carries RLS, so `ctx` is required even for the
+    /// "Semua Sekolah" (national) scope — callers wanting the platform-wide view pass
+    /// `TenantCtx::platform_admin()` (see `GamificationService::leaderboard`), not a real
+    /// school's `TenantCtx::school(..)`, which would silently narrow results to one tenant.
+    async fn top_students(&self, params: LeaderboardParams, ctx: &TenantCtx) -> AppResult<Vec<LeaderboardEntry>>;
 
     /// Same shape, but ranked by real answer accuracy (%) within one subject instead of
     /// overall score — `best_score` on the returned entries carries the accuracy percentage.
-    async fn top_students_by_subject(&self, params: LeaderboardParams, subject: &str) -> AppResult<Vec<LeaderboardEntry>>;
+    /// See `top_students` doc comment re: `ctx` scope for "Semua Sekolah".
+    async fn top_students_by_subject(&self, params: LeaderboardParams, subject: &str, ctx: &TenantCtx) -> AppResult<Vec<LeaderboardEntry>>;
 }
 
 // ─── Rasionalisasi SNBT/SNBP ────────────────────────────────────────────────────
@@ -834,9 +888,9 @@ pub struct RaporScoreUpsert {
 pub trait RaporScoreRepository: Send + Sync {
     /// Upserts on `(student_id, semester, subject)` — students edit their own rapor entry
     /// by re-submitting the same semester+subject, never accumulating duplicate rows.
-    async fn upsert(&self, student_id: Uuid, entry: RaporScoreUpsert) -> AppResult<RaporScore>;
-    async fn list_by_student(&self, student_id: Uuid) -> AppResult<Vec<RaporScore>>;
-    async fn delete(&self, student_id: Uuid, id: Uuid) -> AppResult<bool>;
+    async fn upsert(&self, student_id: Uuid, entry: RaporScoreUpsert, ctx: &TenantCtx) -> AppResult<RaporScore>;
+    async fn list_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<RaporScore>>;
+    async fn delete(&self, student_id: Uuid, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
 }
 
 pub struct NewPtnTarget {
@@ -849,10 +903,10 @@ pub struct NewPtnTarget {
 
 #[async_trait]
 pub trait PtnTargetRepository: Send + Sync {
-    async fn create(&self, new_target: NewPtnTarget) -> AppResult<PtnTarget>;
-    async fn list_by_student(&self, student_id: Uuid) -> AppResult<Vec<PtnTarget>>;
-    async fn set_priority(&self, student_id: Uuid, id: Uuid, priority: Priority) -> AppResult<Option<PtnTarget>>;
-    async fn delete(&self, student_id: Uuid, id: Uuid) -> AppResult<bool>;
+    async fn create(&self, new_target: NewPtnTarget, ctx: &TenantCtx) -> AppResult<PtnTarget>;
+    async fn list_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<PtnTarget>>;
+    async fn set_priority(&self, student_id: Uuid, id: Uuid, priority: Priority, ctx: &TenantCtx) -> AppResult<Option<PtnTarget>>;
+    async fn delete(&self, student_id: Uuid, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
 }
 
 // ─── School Rasionalisasi sub-tabs: Alumni benchmark + SNBP eligibility ─────────
@@ -875,17 +929,17 @@ pub struct AlumniRaporScoreUpsert {
 
 #[async_trait]
 pub trait AlumniBenchmarkRepository: Send + Sync {
-    async fn create(&self, new_benchmark: NewAlumniBenchmark) -> AppResult<AlumniBenchmark>;
-    async fn list_by_school(&self, school_id: Uuid) -> AppResult<Vec<AlumniBenchmark>>;
+    async fn create(&self, new_benchmark: NewAlumniBenchmark, ctx: &TenantCtx) -> AppResult<AlumniBenchmark>;
+    async fn list_by_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<AlumniBenchmark>>;
     /// Dipakai untuk verifikasi kepemilikan (`alumni.school_id == actor's school_id`)
     /// sebelum membaca/menulis "Detail Rapor" milik alumni ini.
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<AlumniBenchmark>>;
-    async fn delete(&self, school_id: Uuid, id: Uuid) -> AppResult<bool>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<AlumniBenchmark>>;
+    async fn delete(&self, school_id: Uuid, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// "Detail Rapor" opsional per alumni — upsert on `(alumni_id, subject)`, sama pola
     /// dengan `RaporScoreRepository::upsert` milik siswa aktif tapi tanpa dimensi semester.
-    async fn upsert_rapor(&self, alumni_id: Uuid, entry: AlumniRaporScoreUpsert) -> AppResult<AlumniRaporScore>;
-    async fn list_rapor(&self, alumni_id: Uuid) -> AppResult<Vec<AlumniRaporScore>>;
-    async fn delete_rapor(&self, alumni_id: Uuid, id: Uuid) -> AppResult<bool>;
+    async fn upsert_rapor(&self, alumni_id: Uuid, entry: AlumniRaporScoreUpsert, ctx: &TenantCtx) -> AppResult<AlumniRaporScore>;
+    async fn list_rapor(&self, alumni_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<AlumniRaporScore>>;
+    async fn delete_rapor(&self, alumni_id: Uuid, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
 }
 
 pub struct SchoolEligibilityUpsert {
@@ -897,8 +951,8 @@ pub struct SchoolEligibilityUpsert {
 pub trait SchoolEligibilityRepository: Send + Sync {
     /// Upserts on `(school_id, year)` — the School PIC edits their own year's figure by
     /// re-submitting the same year, never accumulating duplicate rows.
-    async fn upsert(&self, school_id: Uuid, entry: SchoolEligibilityUpsert) -> AppResult<SchoolEligibility>;
-    async fn list_by_school(&self, school_id: Uuid) -> AppResult<Vec<SchoolEligibility>>;
+    async fn upsert(&self, school_id: Uuid, entry: SchoolEligibilityUpsert, ctx: &TenantCtx) -> AppResult<SchoolEligibility>;
+    async fn list_by_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<SchoolEligibility>>;
 }
 
 // ─── Student achievements ("Prestasi") ───────────────────────────────────────────
@@ -913,12 +967,12 @@ pub struct NewAchievement {
 
 #[async_trait]
 pub trait AchievementRepository: Send + Sync {
-    async fn create(&self, new_achievement: NewAchievement) -> AppResult<Achievement>;
-    async fn list_by_student(&self, student_id: Uuid) -> AppResult<Vec<Achievement>>;
-    async fn delete(&self, student_id: Uuid, id: Uuid) -> AppResult<bool>;
+    async fn create(&self, new_achievement: NewAchievement, ctx: &TenantCtx) -> AppResult<Achievement>;
+    async fn list_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Achievement>>;
+    async fn delete(&self, student_id: Uuid, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
     /// Attaches (or clears, with `None`) a certificate scan URL to an existing achievement
     /// — uploaded as a separate step after the achievement's text data is saved.
-    async fn set_certificate(&self, student_id: Uuid, id: Uuid, certificate_url: Option<String>) -> AppResult<Option<Achievement>>;
+    async fn set_certificate(&self, student_id: Uuid, id: Uuid, certificate_url: Option<String>, ctx: &TenantCtx) -> AppResult<Option<Achievement>>;
 }
 
 // ─── SNBT post-exam tracking ("Rekap SNBT") ─────────────────────────────────────
@@ -934,8 +988,8 @@ pub struct SnbtTrackingUpsert {
 pub trait SnbtTrackingRepository: Send + Sync {
     /// Upserts on `student_id` (unique) — one real exam result per student, re-submitting
     /// for the same student updates it in place rather than accumulating duplicate rows.
-    async fn upsert(&self, student_id: Uuid, entry: SnbtTrackingUpsert) -> AppResult<SnbtTracking>;
-    async fn get_by_student(&self, student_id: Uuid) -> AppResult<Option<SnbtTracking>>;
+    async fn upsert(&self, student_id: Uuid, entry: SnbtTrackingUpsert, ctx: &TenantCtx) -> AppResult<SnbtTracking>;
+    async fn get_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SnbtTracking>>;
 }
 
 // ─── SNBP roster metadata ("Daftar Siswa") ──────────────────────────────────────
@@ -955,9 +1009,9 @@ pub struct SnbpParticipationUpsert {
 pub trait SnbpParticipationRepository: Send + Sync {
     /// Upserts on `student_id` (unique) — the School PIC edits a student's roster
     /// entry by re-submitting for the same student, never accumulating duplicate rows.
-    async fn upsert(&self, student_id: Uuid, entry: SnbpParticipationUpsert) -> AppResult<SnbpParticipation>;
-    async fn get_by_student(&self, student_id: Uuid) -> AppResult<Option<SnbpParticipation>>;
-    async fn list_by_school(&self, school_id: Uuid) -> AppResult<Vec<SnbpParticipation>>;
+    async fn upsert(&self, student_id: Uuid, entry: SnbpParticipationUpsert, ctx: &TenantCtx) -> AppResult<SnbpParticipation>;
+    async fn get_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SnbpParticipation>>;
+    async fn list_by_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<SnbpParticipation>>;
 }
 
 // ─── Saved reports ("Laporan") ───────────────────────────────────────────────────
@@ -975,10 +1029,10 @@ pub struct NewReport {
 
 #[async_trait]
 pub trait ReportRepository: Send + Sync {
-    async fn create(&self, input: NewReport) -> AppResult<Report>;
-    async fn list_by_school(&self, school_id: Uuid) -> AppResult<Vec<Report>>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Report>>;
-    async fn delete(&self, id: Uuid) -> AppResult<()>;
+    async fn create(&self, input: NewReport, ctx: &TenantCtx) -> AppResult<Report>;
+    async fn list_by_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Report>>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Report>>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<()>;
 }
 
 // ─── Audit trail ("Riwayat Perubahan") for edit-on-behalf actions ──────────────────
@@ -995,9 +1049,9 @@ pub struct NewAuditLogEntry {
 
 #[async_trait]
 pub trait AuditLogRepository: Send + Sync {
-    async fn record(&self, entry: NewAuditLogEntry) -> AppResult<AuditLogEntry>;
+    async fn record(&self, entry: NewAuditLogEntry, ctx: &TenantCtx) -> AppResult<AuditLogEntry>;
     /// Most recent entries first, capped at `limit`.
-    async fn list_by_student(&self, student_id: Uuid, limit: i64) -> AppResult<Vec<AuditLogEntry>>;
+    async fn list_by_student(&self, student_id: Uuid, limit: i64, ctx: &TenantCtx) -> AppResult<Vec<AuditLogEntry>>;
 }
 
 // ─── Payment transactions (gateway scaffolding) ────────────────────────────────────
@@ -1020,14 +1074,17 @@ pub struct PaymentStatusUpdate {
 
 #[async_trait]
 pub trait PaymentTransactionRepository: Send + Sync {
-    async fn create(&self, input: NewPaymentTransaction) -> AppResult<PaymentTransaction>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<PaymentTransaction>>;
-    async fn find_by_provider_ref(&self, provider_ref: &str) -> AppResult<Option<PaymentTransaction>>;
-    async fn list_by_buyer(&self, buyer_user_id: Uuid) -> AppResult<Vec<PaymentTransaction>>;
+    async fn create(&self, input: NewPaymentTransaction, ctx: &TenantCtx) -> AppResult<PaymentTransaction>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<PaymentTransaction>>;
+    /// Always called with `TenantCtx::platform_admin()` — a payment provider webhook has no
+    /// per-tenant actor at all, it's resolving `provider_ref` platform-wide by definition.
+    async fn find_by_provider_ref(&self, provider_ref: &str, ctx: &TenantCtx) -> AppResult<Option<PaymentTransaction>>;
+    async fn list_by_buyer(&self, buyer_user_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<PaymentTransaction>>;
     /// Powers the admin "manual purchase request" queue — every transaction currently
-    /// sitting in one status (typically `Pending`), most recent first.
-    async fn list_by_status(&self, status: PaymentStatus) -> AppResult<Vec<PaymentTransaction>>;
-    async fn update_status(&self, id: Uuid, update: PaymentStatusUpdate) -> AppResult<PaymentTransaction>;
+    /// sitting in one status (typically `Pending`), most recent first. Always called with
+    /// `TenantCtx::platform_admin()` (admin manages the queue across every tenant).
+    async fn list_by_status(&self, status: PaymentStatus, ctx: &TenantCtx) -> AppResult<Vec<PaymentTransaction>>;
+    async fn update_status(&self, id: Uuid, update: PaymentStatusUpdate, ctx: &TenantCtx) -> AppResult<PaymentTransaction>;
 }
 
 // ─── Subject taxonomy (Kategori & Mata Uji) ────────────────────────────────────
@@ -1082,23 +1139,23 @@ pub struct NewSimulationTemplate {
 
 #[async_trait]
 pub trait SimulationTemplateRepository: Send + Sync {
-    async fn create(&self, input: NewSimulationTemplate) -> AppResult<SimulationTemplate>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<SimulationTemplate>>;
+    async fn create(&self, input: NewSimulationTemplate, ctx: &TenantCtx) -> AppResult<SimulationTemplate>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
     /// `only_active = true` filters to `is_active = true` (used for the student-facing list).
-    async fn list(&self, only_active: bool) -> AppResult<Vec<SimulationTemplate>>;
-    async fn set_active(&self, id: Uuid, active: bool) -> AppResult<Option<SimulationTemplate>>;
-    async fn set_premium(&self, id: Uuid, is_premium: bool) -> AppResult<Option<SimulationTemplate>>;
+    async fn list(&self, only_active: bool, ctx: &TenantCtx) -> AppResult<Vec<SimulationTemplate>>;
+    async fn set_active(&self, id: Uuid, active: bool, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
+    async fn set_premium(&self, id: Uuid, is_premium: bool, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
     /// Cheap targeted toggle — used by `PackageService::set_active`'s publish cascade and by
     /// an owner manually flipping draft status.
-    async fn set_draft(&self, id: Uuid, is_draft: bool) -> AppResult<Option<SimulationTemplate>>;
+    async fn set_draft(&self, id: Uuid, is_draft: bool, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
     /// See `domain::simulation::SimulationTemplate::lockdown_override` doc comment. `None`
     /// resets to "inherit the global default".
-    async fn set_lockdown(&self, id: Uuid, lockdown_override: Option<bool>) -> AppResult<Option<SimulationTemplate>>;
+    async fn set_lockdown(&self, id: Uuid, lockdown_override: Option<bool>, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
     /// `Ok(false)` if not found; fails with `AppError::Conflict` at the repository level if
     /// any `simulation_runs` already reference this template (preserve run history) — mirrors
     /// `TryoutSessionRepository::delete`'s doc comment describing the same FK-conflict pattern
     /// for attempts.
-    async fn delete(&self, id: Uuid) -> AppResult<bool>;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
 }
 
 pub struct NewSimulationRunSlot {
@@ -1121,27 +1178,30 @@ pub struct NewSimulationRun {
 pub trait SimulationRunRepository: Send + Sync {
     /// Creates the run row AND all its `simulation_run_slots` rows (all `pending`, no
     /// attempt yet) in one call — implemented as a DB transaction in the Postgres impl.
-    async fn create(&self, input: NewSimulationRun) -> AppResult<SimulationRun>;
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<SimulationRun>>;
-    async fn list_by_student(&self, student_id: Uuid) -> AppResult<Vec<SimulationRun>>;
+    async fn create(&self, input: NewSimulationRun, ctx: &TenantCtx) -> AppResult<SimulationRun>;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SimulationRun>>;
+    async fn list_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<SimulationRun>>;
     /// Student's most recent `completed` run, if any — ordered by `completed_at DESC LIMIT 1`.
-    async fn latest_completed_for_student(&self, student_id: Uuid) -> AppResult<Option<SimulationRun>>;
+    async fn latest_completed_for_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SimulationRun>>;
     async fn set_run_status(
         &self,
         run_id: Uuid,
         status: SimulationRunStatus,
         completed_at: Option<DateTime<Utc>>,
         combined_estimate_score: Option<f64>,
+        ctx: &TenantCtx,
     ) -> AppResult<()>;
-    async fn advance_current_index(&self, run_id: Uuid, new_index: i32) -> AppResult<()>;
+    async fn advance_current_index(&self, run_id: Uuid, new_index: i32, ctx: &TenantCtx) -> AppResult<()>;
     /// Marks the slot at `sequence_index` within `run_id` as `active`, attaches `attempt_id`
     /// and `deadline_at`.
-    async fn activate_slot(&self, run_id: Uuid, sequence_index: i32, attempt_id: Uuid, deadline_at: DateTime<Utc>) -> AppResult<()>;
+    async fn activate_slot(&self, run_id: Uuid, sequence_index: i32, attempt_id: Uuid, deadline_at: DateTime<Utc>, ctx: &TenantCtx) -> AppResult<()>;
     /// Marks the slot at `sequence_index` within `run_id` as `submitted`, sets `break_ends_at`.
-    async fn submit_slot(&self, run_id: Uuid, sequence_index: i32, break_ends_at: Option<DateTime<Utc>>) -> AppResult<()>;
+    async fn submit_slot(&self, run_id: Uuid, sequence_index: i32, break_ends_at: Option<DateTime<Utc>>, ctx: &TenantCtx) -> AppResult<()>;
     /// See `domain::simulation::TemplateCompletionStats` doc comment — honest, aggregate-only
     /// benchmark for the sertifikat/laporan PDF, computed live (not cached/denormalized).
-    async fn template_completion_stats(&self, template_id: Uuid) -> AppResult<TemplateCompletionStats>;
+    /// Always called with `TenantCtx::platform_admin()` — a per-template stat spans every
+    /// school that ever ran it, not one tenant.
+    async fn template_completion_stats(&self, template_id: Uuid, ctx: &TenantCtx) -> AppResult<TemplateCompletionStats>;
 }
 
 /// See `domain::simulation::LockdownViolation` doc comment.
@@ -1154,10 +1214,10 @@ pub struct NewLockdownViolation {
 
 #[async_trait]
 pub trait LockdownViolationRepository: Send + Sync {
-    async fn record(&self, input: NewLockdownViolation) -> AppResult<crate::domain::simulation::LockdownViolation>;
+    async fn record(&self, input: NewLockdownViolation, ctx: &TenantCtx) -> AppResult<crate::domain::simulation::LockdownViolation>;
     /// Newest first — used by both the student's own live warning history and the Admin/Sekolah
     /// review view.
-    async fn list_by_run(&self, run_id: Uuid) -> AppResult<Vec<crate::domain::simulation::LockdownViolation>>;
+    async fn list_by_run(&self, run_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<crate::domain::simulation::LockdownViolation>>;
 }
 
 // ─── Platform settings ──────────────────────────────────────────────────────────

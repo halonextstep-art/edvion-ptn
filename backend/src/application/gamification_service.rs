@@ -17,6 +17,7 @@ use crate::domain::repository::{
     BadgeRepository, BadgeUpdate, ChallengeRepository, ChallengeUpdate, LeaderboardParams, LeaderboardRepository,
     NewBadge, NewChallenge, NewPointRule, PointRuleRepository, PointRuleUpdate, UserRepository,
 };
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
 use crate::interfaces::http::middleware::AuthUser;
@@ -78,7 +79,7 @@ impl GamificationService {
     /// actors, since both roles carry a real `school_id` on their `users` row. Used to
     /// scope the "Sekolahku" leaderboard view without trusting a client-supplied id.
     async fn resolve_actor_school_id(&self, actor: &AuthUser) -> AppResult<Uuid> {
-        let me = self.users.find_by_id(actor.user_id).await?.ok_or_else(|| AppError::Unauthorized("akun tidak ditemukan".to_string()))?;
+        let me = self.users.find_by_id(actor.user_id, &actor.tenant).await?.ok_or_else(|| AppError::Unauthorized("akun tidak ditemukan".to_string()))?;
         me.school_id.ok_or_else(|| AppError::Validation("akun ini belum terhubung ke data sekolah".to_string()))
     }
 
@@ -89,34 +90,37 @@ impl GamificationService {
             return Err(AppError::Validation("nama aksi wajib diisi".to_string()));
         }
         self.point_rules
-            .create(NewPointRule {
-                action: input.action,
-                category: input.category,
-                base_points: input.base_points,
-                multiplier: input.multiplier,
-                enabled: input.enabled,
-                icon: input.icon,
-                sort_order: input.sort_order,
-            })
+            .create(
+                NewPointRule {
+                    action: input.action,
+                    category: input.category,
+                    base_points: input.base_points,
+                    multiplier: input.multiplier,
+                    enabled: input.enabled,
+                    icon: input.icon,
+                    sort_order: input.sort_order,
+                },
+                &actor.tenant,
+            )
             .await
     }
 
     pub async fn list_point_rules(&self, actor: &AuthUser) -> AppResult<Vec<PointRule>> {
         actor.require_role(&[Role::Admin])?;
-        self.point_rules.list().await
+        self.point_rules.list(&actor.tenant).await
     }
 
     pub async fn update_point_rule(&self, actor: &AuthUser, id: Uuid, base_points: i32, multiplier: f64, enabled: bool) -> AppResult<PointRule> {
         actor.require_role(&[Role::Admin])?;
         self.point_rules
-            .update(id, PointRuleUpdate { base_points, multiplier, enabled })
+            .update(id, PointRuleUpdate { base_points, multiplier, enabled }, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("point rule {id} not found")))
     }
 
     pub async fn delete_point_rule(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin])?;
-        if !self.point_rules.delete(id).await? {
+        if !self.point_rules.delete(id, &actor.tenant).await? {
             return Err(AppError::NotFound(format!("point rule {id} not found")));
         }
         Ok(())
@@ -130,27 +134,30 @@ impl GamificationService {
         }
         let badge = self
             .badges
-            .create(NewBadge {
-                emoji: input.emoji,
-                icon_type: input.icon_type,
-                icon_name: input.icon_name,
-                icon_url: input.icon_url,
-                name: input.name,
-                description: input.description,
-                rarity: input.rarity,
-                condition_type: input.condition_type,
-                condition_value: input.condition_value,
-                active: input.active,
-                created_by: actor.user_id,
-            })
+            .create(
+                NewBadge {
+                    emoji: input.emoji,
+                    icon_type: input.icon_type,
+                    icon_name: input.icon_name,
+                    icon_url: input.icon_url,
+                    name: input.name,
+                    description: input.description,
+                    rarity: input.rarity,
+                    condition_type: input.condition_type,
+                    condition_value: input.condition_value,
+                    active: input.active,
+                    created_by: actor.user_id,
+                },
+                &actor.tenant,
+            )
             .await?;
-        let earned_by = self.badges.earned_count(badge.condition_type, badge.condition_value).await?;
+        let earned_by = self.badges.earned_count(badge.condition_type, badge.condition_value, &actor.tenant).await?;
         Ok(BadgeWithStats { badge, earned_by })
     }
 
     pub async fn list_badges(&self, actor: &AuthUser) -> AppResult<Vec<BadgeWithStats>> {
         actor.require_role(&[Role::Admin])?;
-        self.badges.list_with_stats().await
+        self.badges.list_with_stats(&actor.tenant).await
     }
 
     pub async fn update_badge(&self, actor: &AuthUser, id: Uuid, input: CreateBadgeInput) -> AppResult<BadgeWithStats> {
@@ -174,23 +181,24 @@ impl GamificationService {
                     condition_value: input.condition_value,
                     active: input.active,
                 },
+                &actor.tenant,
             )
             .await?
             .ok_or_else(|| AppError::NotFound(format!("badge {id} not found")))?;
-        let earned_by = self.badges.earned_count(badge.condition_type, badge.condition_value).await?;
+        let earned_by = self.badges.earned_count(badge.condition_type, badge.condition_value, &actor.tenant).await?;
         Ok(BadgeWithStats { badge, earned_by })
     }
 
     pub async fn set_badge_active(&self, actor: &AuthUser, id: Uuid, active: bool) -> AppResult<BadgeWithStats> {
         actor.require_role(&[Role::Admin])?;
-        let badge = self.badges.set_active(id, active).await?.ok_or_else(|| AppError::NotFound(format!("badge {id} not found")))?;
-        let earned_by = self.badges.earned_count(badge.condition_type, badge.condition_value).await?;
+        let badge = self.badges.set_active(id, active, &actor.tenant).await?.ok_or_else(|| AppError::NotFound(format!("badge {id} not found")))?;
+        let earned_by = self.badges.earned_count(badge.condition_type, badge.condition_value, &actor.tenant).await?;
         Ok(BadgeWithStats { badge, earned_by })
     }
 
     pub async fn delete_badge(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin])?;
-        if !self.badges.delete(id).await? {
+        if !self.badges.delete(id, &actor.tenant).await? {
             return Err(AppError::NotFound(format!("badge {id} not found")));
         }
         Ok(())
@@ -200,7 +208,7 @@ impl GamificationService {
     /// toward every active badge.
     pub async fn my_badges(&self, actor: &AuthUser) -> AppResult<Vec<StudentBadgeStatus>> {
         actor.require_role(&[Role::Student])?;
-        self.badges.list_for_student(actor.user_id).await
+        self.badges.list_for_student(actor.user_id, &actor.tenant).await
     }
 
     // ─── Challenges ───────────────────────────────────────────────────────────
@@ -214,25 +222,28 @@ impl GamificationService {
         }
         let challenge = self
             .challenges
-            .create(NewChallenge {
-                name: input.name,
-                challenge_type: input.challenge_type,
-                start_date: input.start_date,
-                end_date: input.end_date,
-                target_value: input.target_value,
-                reward_points: input.reward_points,
-                reward_badge: input.reward_badge,
-                description: input.description,
-                created_by: actor.user_id,
-            })
+            .create(
+                NewChallenge {
+                    name: input.name,
+                    challenge_type: input.challenge_type,
+                    start_date: input.start_date,
+                    end_date: input.end_date,
+                    target_value: input.target_value,
+                    reward_points: input.reward_points,
+                    reward_badge: input.reward_badge,
+                    description: input.description,
+                    created_by: actor.user_id,
+                },
+                &actor.tenant,
+            )
             .await?;
-        let (participants, completions) = self.challenges.stats_for(&challenge).await?;
+        let (participants, completions) = self.challenges.stats_for(&challenge, &actor.tenant).await?;
         Ok(ChallengeWithStats { challenge, participants, completions })
     }
 
     pub async fn list_challenges(&self, actor: &AuthUser) -> AppResult<Vec<ChallengeWithStats>> {
         actor.require_role(&[Role::Admin])?;
-        self.challenges.list_with_stats().await
+        self.challenges.list_with_stats(&actor.tenant).await
     }
 
     pub async fn update_challenge(&self, actor: &AuthUser, id: Uuid, input: CreateChallengeInput) -> AppResult<ChallengeWithStats> {
@@ -254,23 +265,25 @@ impl GamificationService {
                     reward_badge: input.reward_badge,
                     description: input.description,
                 },
+                &actor.tenant,
             )
             .await?
             .ok_or_else(|| AppError::NotFound(format!("challenge {id} not found")))?;
-        let (participants, completions) = self.challenges.stats_for(&challenge).await?;
+        let (participants, completions) = self.challenges.stats_for(&challenge, &actor.tenant).await?;
         Ok(ChallengeWithStats { challenge, participants, completions })
     }
 
     pub async fn set_challenge_status(&self, actor: &AuthUser, id: Uuid, status: ChallengeStatus) -> AppResult<ChallengeWithStats> {
         actor.require_role(&[Role::Admin])?;
-        let challenge = self.challenges.set_status(id, status).await?.ok_or_else(|| AppError::NotFound(format!("challenge {id} not found")))?;
-        let (participants, completions) = self.challenges.stats_for(&challenge).await?;
+        let challenge =
+            self.challenges.set_status(id, status, &actor.tenant).await?.ok_or_else(|| AppError::NotFound(format!("challenge {id} not found")))?;
+        let (participants, completions) = self.challenges.stats_for(&challenge, &actor.tenant).await?;
         Ok(ChallengeWithStats { challenge, participants, completions })
     }
 
     pub async fn delete_challenge(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin])?;
-        if !self.challenges.delete(id).await? {
+        if !self.challenges.delete(id, &actor.tenant).await? {
             return Err(AppError::NotFound(format!("challenge {id} not found")));
         }
         Ok(())
@@ -289,14 +302,21 @@ impl GamificationService {
         subject: Option<String>,
     ) -> AppResult<Vec<LeaderboardEntry>> {
         actor.require_role(&[Role::Admin, Role::Student, Role::School])?;
-        let school_id = match scope {
-            LeaderboardScope::National => None,
-            LeaderboardScope::School => Some(self.resolve_actor_school_id(actor).await?),
+        // "Semua Sekolah" (National) must see every tenant's attempts, not just the actor's
+        // own — `ptn.attempts`/`core.akun` carry RLS, so this requires the platform-admin
+        // bypass ctx rather than the actor's real (possibly school-scoped) `TenantCtx`, even
+        // when the actor themself isn't a platform admin (every role in `require_role` above
+        // is allowed to view the national leaderboard; RLS scope and permission are separate
+        // concerns here). "Sekolahku" (School) stays correctly scoped to the actor's own
+        // tenant via their real `TenantCtx`.
+        let (school_id, ctx) = match scope {
+            LeaderboardScope::National => (None, TenantCtx::platform_admin()),
+            LeaderboardScope::School => (Some(self.resolve_actor_school_id(actor).await?), actor.tenant),
         };
         let params = LeaderboardParams { limit: limit.clamp(1, 100), school_id, range };
         match subject.filter(|s| !s.trim().is_empty()) {
-            Some(subject) => self.leaderboard.top_students_by_subject(params, &subject).await,
-            None => self.leaderboard.top_students(params).await,
+            Some(subject) => self.leaderboard.top_students_by_subject(params, &subject, &ctx).await,
+            None => self.leaderboard.top_students(params, &ctx).await,
         }
     }
 }

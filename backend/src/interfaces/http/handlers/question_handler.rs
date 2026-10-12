@@ -57,7 +57,7 @@ pub async fn list(
         page_size,
     };
 
-    let (items, total) = state.question_service.list(filter).await?;
+    let (items, total) = state.question_service.list(filter, &auth.tenant).await?;
     Ok(Json(QuestionListResponse {
         items: items.into_iter().map(Into::into).collect(),
         total,
@@ -68,10 +68,10 @@ pub async fn list(
 
 pub async fn get(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<QuestionResponse>> {
-    let question = state.question_service.get(id).await?;
+    let question = state.question_service.get(id, &auth.tenant).await?;
     Ok(Json(question.into()))
 }
 

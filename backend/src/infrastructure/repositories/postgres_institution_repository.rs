@@ -19,7 +19,7 @@ impl PostgresInstitutionRepository {
 
 #[derive(sqlx::FromRow)]
 struct InstitutionRow {
-    id: Uuid,
+    public_id: Uuid,
     nama_ptn: String,
     singkatan: String,
     website: Option<String>,
@@ -38,7 +38,7 @@ struct InstitutionRow {
 impl From<InstitutionRow> for Institution {
     fn from(r: InstitutionRow) -> Self {
         Institution {
-            id: r.id,
+            id: r.public_id,
             nama_ptn: r.nama_ptn,
             singkatan: r.singkatan,
             website: r.website,
@@ -56,15 +56,14 @@ impl From<InstitutionRow> for Institution {
     }
 }
 
-const SELECT_INSTITUTION: &str = "SELECT id, nama_ptn, singkatan, website, alamat, kota, provinsi, tahun_berdiri, status, akreditasi, logo_url, sumber, created_at, updated_at FROM institutions";
+const SELECT_INSTITUTION: &str = "SELECT public_id, nama_ptn, singkatan, website, alamat, kota, provinsi, tahun_berdiri, status, akreditasi, logo_url, sumber, created_at, updated_at FROM ptn.institutions";
 
 #[async_trait]
 impl InstitutionRepository for PostgresInstitutionRepository {
     async fn upsert_by_nama_ptn(&self, input: NewInstitution) -> AppResult<Institution> {
-        let id = Uuid::new_v4();
         let row = sqlx::query_as::<_, InstitutionRow>(&format!(
-            r#"INSERT INTO institutions (id, nama_ptn, singkatan, website, alamat, kota, provinsi, tahun_berdiri, status, akreditasi, logo_url, sumber)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            r#"INSERT INTO ptn.institutions (nama_ptn, singkatan, website, alamat, kota, provinsi, tahun_berdiri, status, akreditasi, logo_url, sumber)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                ON CONFLICT (nama_ptn) DO UPDATE SET
                    singkatan = EXCLUDED.singkatan,
                    website = EXCLUDED.website,
@@ -78,9 +77,8 @@ impl InstitutionRepository for PostgresInstitutionRepository {
                    sumber = EXCLUDED.sumber,
                    updated_at = now()
                RETURNING {cols}"#,
-            cols = "id, nama_ptn, singkatan, website, alamat, kota, provinsi, tahun_berdiri, status, akreditasi, logo_url, sumber, created_at, updated_at"
+            cols = "public_id, nama_ptn, singkatan, website, alamat, kota, provinsi, tahun_berdiri, status, akreditasi, logo_url, sumber, created_at, updated_at"
         ))
-        .bind(id)
         .bind(&input.nama_ptn)
         .bind(&input.singkatan)
         .bind(&input.website)
@@ -98,7 +96,7 @@ impl InstitutionRepository for PostgresInstitutionRepository {
     }
 
     async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Institution>> {
-        let row = sqlx::query_as::<_, InstitutionRow>(&format!("{SELECT_INSTITUTION} WHERE id = $1"))
+        let row = sqlx::query_as::<_, InstitutionRow>(&format!("{SELECT_INSTITUTION} WHERE public_id = $1"))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -133,13 +131,13 @@ impl InstitutionRepository for PostgresInstitutionRepository {
 
     async fn update(&self, id: Uuid, update: InstitutionUpdate) -> AppResult<Option<Institution>> {
         let row = sqlx::query_as::<_, InstitutionRow>(&format!(
-            r#"UPDATE institutions SET
+            r#"UPDATE ptn.institutions SET
                    singkatan = $2, website = $3, alamat = $4, kota = $5, provinsi = $6,
                    tahun_berdiri = $7, status = $8, akreditasi = $9, logo_url = $10, sumber = $11,
                    updated_at = now()
-               WHERE id = $1
+               WHERE public_id = $1
                RETURNING {cols}"#,
-            cols = "id, nama_ptn, singkatan, website, alamat, kota, provinsi, tahun_berdiri, status, akreditasi, logo_url, sumber, created_at, updated_at"
+            cols = "public_id, nama_ptn, singkatan, website, alamat, kota, provinsi, tahun_berdiri, status, akreditasi, logo_url, sumber, created_at, updated_at"
         ))
         .bind(id)
         .bind(&update.singkatan)
@@ -158,7 +156,7 @@ impl InstitutionRepository for PostgresInstitutionRepository {
     }
 
     async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM institutions WHERE id = $1")
+        let result = sqlx::query("DELETE FROM ptn.institutions WHERE public_id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;

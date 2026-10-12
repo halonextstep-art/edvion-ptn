@@ -13,6 +13,7 @@ use axum_extra::headers::{authorization::Bearer, Authorization};
 use axum_extra::TypedHeader;
 use uuid::Uuid;
 
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::error::AppError;
 use crate::interfaces::http::state::AppState;
@@ -22,6 +23,9 @@ pub struct AuthUser {
     pub user_id: Uuid,
     pub email: String,
     pub role: Role,
+    /// RLS session context for this request — every repository call the handler makes
+    /// must be given this so it can `set_config('app.tenant_id', ...)` before querying.
+    pub tenant: TenantCtx,
 }
 
 impl AuthUser {
@@ -59,6 +63,7 @@ impl FromRequestParts<AppState> for AuthUser {
 
         Ok(AuthUser {
             user_id: claims.sub,
+            tenant: claims.tenant_ctx(),
             email: claims.email,
             role,
         })

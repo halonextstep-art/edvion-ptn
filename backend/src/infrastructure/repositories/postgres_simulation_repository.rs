@@ -1,12 +1,12 @@
 //! Postgres implementations for Simulasi UTBK — see `domain::simulation` doc comment and the
-//! `20250101000025_simulation.sql` migration for the full rationale. Two tightly-related
-//! repositories (template CRUD, run state machine storage) live in one file since they share
-//! the same join shape (both read through `tryout_sessions` for the display fields) and are
-//! always wired together by `SimulationService`.
+//! `20260101000005_ptn_gamification_and_simulation.sql` migration for the full rationale. Two
+//! tightly-related repositories (template CRUD, run state machine storage) live in one file
+//! since they share the same join shape (both read through `ptn.tryout_sessions` for the
+//! display fields) and are always wired together by `SimulationService`.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::domain::package::ExamTrack;
@@ -19,8 +19,19 @@ use crate::domain::simulation::{
     LockdownViolation, SimulationRun, SimulationRunSlot, SimulationRunStatus, SimulationSlotStatus,
     SimulationTemplate, SimulationTemplateKind, SimulationTemplateSlot, TemplateCompletionStats,
 };
+use crate::domain::tenant::TenantCtx;
 use crate::error::{AppError, AppResult};
 use std::str::FromStr;
+
+async fn begin_tx(pool: &PgPool, ctx: &TenantCtx) -> AppResult<Transaction<'static, Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true), set_config('app.is_platform_admin', $2, true)")
+        .bind(ctx.tenant_id.to_string())
+        .bind(if ctx.is_platform_admin { "true" } else { "false" })
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
 
 fn parse_school_type_scope(s: Option<&str>) -> AppResult<Option<SchoolType>> {
     s.map(SchoolType::from_str)
@@ -107,27 +118,29 @@ impl PostgresSimulationTemplateRepository {
         Self { pool }
     }
 
-    async fn slots_for_template(&self, template_id: Uuid) -> AppResult<Vec<SimulationTemplateSlot>> {
+    async fn slots_for_template(&self, template_id: i64, tx: &mut Transaction<'static, Postgres>) -> AppResult<Vec<SimulationTemplateSlot>> {
         // LEFT JOIN — an `is_elective` slot has `session_id IS NULL` in the template (no fixed
-        // session to join against yet; see `20250101000034_simulation_elective_slots.sql`).
+        // session to join against yet).
         let rows = sqlx::query_as::<_, TemplateSlotRow>(
-            r#"SELECT ts.id, ts.template_id, ts.sequence_index, ts.session_id, s.title AS session_title,
-                      s.duration_minutes, s.question_count, s.subject_filter, ts.break_seconds, ts.is_elective
-               FROM simulation_template_slots ts
-               LEFT JOIN tryout_sessions s ON s.id = ts.session_id
+            r#"SELECT ts.public_id, tt.public_id AS template_id, ts.sequence_index, s.public_id AS session_id,
+                      s.title AS session_title, s.duration_minutes, s.question_count, s.subject_filter,
+                      ts.break_seconds, ts.is_elective
+               FROM ptn.simulation_template_slots ts
+               JOIN ptn.simulation_templates tt ON tt.id = ts.template_id
+               LEFT JOIN ptn.tryout_sessions s ON s.id = ts.session_id
                WHERE ts.template_id = $1
                ORDER BY ts.sequence_index ASC"#,
         )
         .bind(template_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    async fn assemble(&self, row: TemplateRow) -> AppResult<SimulationTemplate> {
-        let slots = self.slots_for_template(row.id).await?;
+    async fn assemble(&self, row: TemplateRow, tx: &mut Transaction<'static, Postgres>) -> AppResult<SimulationTemplate> {
+        let slots = self.slots_for_template(row.internal_id, tx).await?;
         Ok(SimulationTemplate {
-            id: row.id,
+            id: row.public_id,
             title: row.title,
             is_active: row.is_active,
             is_premium: row.is_premium,
@@ -146,7 +159,9 @@ impl PostgresSimulationTemplateRepository {
 
 #[derive(sqlx::FromRow)]
 struct TemplateRow {
-    id: Uuid,
+    #[sqlx(rename = "id")]
+    internal_id: i64,
+    public_id: Uuid,
     title: String,
     is_active: bool,
     is_premium: bool,
@@ -160,13 +175,19 @@ struct TemplateRow {
     lockdown_override: Option<bool>,
 }
 
-// Shared column list for plain SELECTs and UPDATE ... RETURNING clauses.
-const TEMPLATE_COLUMNS: &str =
-    "id, title, is_active, is_premium, is_draft, elective_package_id, template_kind, created_by, created_at, exam_track, school_type_scope, lockdown_override";
+// Shared column list — needs the internal `id` too (for the slots sub-query), alongside
+// `public_id` and `elective_package_id`/`created_by` resolved to their own `public_id`s.
+const TEMPLATE_COLUMNS: &str = r#"
+    t.id, t.public_id, t.title, t.is_active, t.is_premium, t.is_draft,
+    (SELECT public_id FROM ptn.packages WHERE ptn.packages.id = t.elective_package_id) AS elective_package_id,
+    t.template_kind,
+    (SELECT public_id FROM core.akun WHERE core.akun.id = t.created_by) AS created_by,
+    t.created_at, t.exam_track, t.school_type_scope, t.lockdown_override
+"#;
 
 #[derive(sqlx::FromRow)]
 struct TemplateSlotRow {
-    id: Uuid,
+    public_id: Uuid,
     template_id: Uuid,
     sequence_index: i32,
     session_id: Option<Uuid>,
@@ -181,7 +202,7 @@ struct TemplateSlotRow {
 impl From<TemplateSlotRow> for SimulationTemplateSlot {
     fn from(r: TemplateSlotRow) -> Self {
         SimulationTemplateSlot {
-            id: r.id,
+            id: r.public_id,
             template_id: r.template_id,
             sequence_index: r.sequence_index,
             session_id: r.session_id,
@@ -197,144 +218,204 @@ impl From<TemplateSlotRow> for SimulationTemplateSlot {
 
 #[async_trait]
 impl SimulationTemplateRepository for PostgresSimulationTemplateRepository {
-    async fn create(&self, input: NewSimulationTemplate) -> AppResult<SimulationTemplate> {
-        let id = Uuid::new_v4();
-        let mut tx = self.pool.begin().await?;
+    async fn create(&self, input: NewSimulationTemplate, ctx: &TenantCtx) -> AppResult<SimulationTemplate> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
 
-        sqlx::query(
-            r#"INSERT INTO simulation_templates (id, title, is_premium, created_by, is_draft, elective_package_id, template_kind, exam_track, school_type_scope, lockdown_override)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
+        let created_by_id: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(input.created_by)
+            .fetch_one(&mut *tx)
+            .await?;
+        let elective_package_id: Option<i64> = match input.elective_package_id {
+            Some(pid) => Some(
+                sqlx::query_scalar("SELECT id FROM ptn.packages WHERE public_id = $1")
+                    .bind(pid)
+                    .fetch_one(&mut *tx)
+                    .await?,
+            ),
+            None => None,
+        };
+
+        let template_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO ptn.simulation_templates
+                (tenant_id, title, is_premium, created_by, is_draft, elective_package_id, template_kind,
+                 exam_track, school_type_scope, lockdown_override)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+               RETURNING id"#,
         )
-        .bind(id)
+        .bind(ctx.tenant_id)
         .bind(&input.title)
         .bind(input.is_premium)
-        .bind(input.created_by)
+        .bind(created_by_id)
         .bind(input.is_draft)
-        .bind(input.elective_package_id)
+        .bind(elective_package_id)
         .bind(template_kind_str(input.template_kind))
         .bind(exam_track_str(input.exam_track))
         .bind(school_type_scope_str(input.school_type_scope))
         .bind(input.lockdown_override)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
 
         for slot in &input.slots {
+            let session_id: Option<i64> = match slot.session_id {
+                Some(sid) => Some(
+                    sqlx::query_scalar("SELECT id FROM ptn.tryout_sessions WHERE public_id = $1")
+                        .bind(sid)
+                        .fetch_one(&mut *tx)
+                        .await?,
+                ),
+                None => None,
+            };
             sqlx::query(
-                r#"INSERT INTO simulation_template_slots (id, template_id, sequence_index, session_id, break_seconds, is_elective)
-                   VALUES ($1, $2, $3, $4, $5, $6)"#,
+                r#"INSERT INTO ptn.simulation_template_slots (template_id, sequence_index, session_id, break_seconds, is_elective)
+                   VALUES ($1, $2, $3, $4, $5)"#,
             )
-            .bind(Uuid::new_v4())
-            .bind(id)
+            .bind(template_id)
             .bind(slot.sequence_index)
-            .bind(slot.session_id)
+            .bind(session_id)
             .bind(slot.break_seconds)
             .bind(slot.is_elective)
             .execute(&mut *tx)
             .await?;
         }
 
+        let row = sqlx::query_as::<_, TemplateRow>(&format!("SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t WHERE t.id = $1"))
+            .bind(template_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let result = self.assemble(row, &mut tx).await?;
         tx.commit().await?;
-
-        self.find_by_id(id)
-            .await?
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("simulation template vanished right after insert")))
+        Ok(result)
     }
 
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<SimulationTemplate>> {
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let row = sqlx::query_as::<_, TemplateRow>(&format!(
-            "SELECT {TEMPLATE_COLUMNS} FROM simulation_templates WHERE id = $1"
+            "SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t WHERE t.public_id = $1"
         ))
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         match row {
-            Some(r) => Ok(Some(self.assemble(r).await?)),
-            None => Ok(None),
+            Some(r) => {
+                let result = self.assemble(r, &mut tx).await?;
+                tx.commit().await?;
+                Ok(Some(result))
+            }
+            None => {
+                tx.commit().await?;
+                Ok(None)
+            }
         }
     }
 
-    async fn list(&self, only_active: bool) -> AppResult<Vec<SimulationTemplate>> {
+    async fn list(&self, only_active: bool, ctx: &TenantCtx) -> AppResult<Vec<SimulationTemplate>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let rows = if only_active {
             sqlx::query_as::<_, TemplateRow>(&format!(
-                "SELECT {TEMPLATE_COLUMNS} FROM simulation_templates
-                 WHERE is_active = true ORDER BY created_at DESC"
+                "SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t WHERE t.is_active = true ORDER BY t.created_at DESC"
             ))
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?
         } else {
             sqlx::query_as::<_, TemplateRow>(&format!(
-                "SELECT {TEMPLATE_COLUMNS} FROM simulation_templates ORDER BY created_at DESC"
+                "SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t ORDER BY t.created_at DESC"
             ))
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?
         };
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            out.push(self.assemble(row).await?);
+            out.push(self.assemble(row, &mut tx).await?);
         }
+        tx.commit().await?;
         Ok(out)
     }
 
-    async fn set_active(&self, id: Uuid, active: bool) -> AppResult<Option<SimulationTemplate>> {
-        let row = sqlx::query_as::<_, TemplateRow>(&format!(
-            "UPDATE simulation_templates SET is_active = $2 WHERE id = $1 RETURNING {TEMPLATE_COLUMNS}"
-        ))
-        .bind(id)
-        .bind(active)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            Some(r) => Ok(Some(self.assemble(r).await?)),
-            None => Ok(None),
-        }
-    }
-
-    async fn set_premium(&self, id: Uuid, is_premium: bool) -> AppResult<Option<SimulationTemplate>> {
-        let row = sqlx::query_as::<_, TemplateRow>(&format!(
-            "UPDATE simulation_templates SET is_premium = $2 WHERE id = $1 RETURNING {TEMPLATE_COLUMNS}"
-        ))
-        .bind(id)
-        .bind(is_premium)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            Some(r) => Ok(Some(self.assemble(r).await?)),
-            None => Ok(None),
-        }
-    }
-
-    async fn set_draft(&self, id: Uuid, is_draft: bool) -> AppResult<Option<SimulationTemplate>> {
-        let row = sqlx::query_as::<_, TemplateRow>(&format!(
-            "UPDATE simulation_templates SET is_draft = $2 WHERE id = $1 RETURNING {TEMPLATE_COLUMNS}"
-        ))
-        .bind(id)
-        .bind(is_draft)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            Some(r) => Ok(Some(self.assemble(r).await?)),
-            None => Ok(None),
-        }
-    }
-
-    async fn set_lockdown(&self, id: Uuid, lockdown_override: Option<bool>) -> AppResult<Option<SimulationTemplate>> {
-        let row = sqlx::query_as::<_, TemplateRow>(&format!(
-            "UPDATE simulation_templates SET lockdown_override = $2 WHERE id = $1 RETURNING {TEMPLATE_COLUMNS}"
-        ))
-        .bind(id)
-        .bind(lockdown_override)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            Some(r) => Ok(Some(self.assemble(r).await?)),
-            None => Ok(None),
-        }
-    }
-
-    async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM simulation_templates WHERE id = $1")
+    async fn set_active(&self, id: Uuid, active: bool, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let updated = sqlx::query("UPDATE ptn.simulation_templates SET is_active = $2 WHERE public_id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .bind(active)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, TemplateRow>(&format!("SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t WHERE t.public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let result = self.assemble(row, &mut tx).await?;
+        tx.commit().await?;
+        Ok(Some(result))
+    }
+
+    async fn set_premium(&self, id: Uuid, is_premium: bool, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let updated = sqlx::query("UPDATE ptn.simulation_templates SET is_premium = $2 WHERE public_id = $1")
+            .bind(id)
+            .bind(is_premium)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, TemplateRow>(&format!("SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t WHERE t.public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let result = self.assemble(row, &mut tx).await?;
+        tx.commit().await?;
+        Ok(Some(result))
+    }
+
+    async fn set_draft(&self, id: Uuid, is_draft: bool, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let updated = sqlx::query("UPDATE ptn.simulation_templates SET is_draft = $2 WHERE public_id = $1")
+            .bind(id)
+            .bind(is_draft)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, TemplateRow>(&format!("SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t WHERE t.public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let result = self.assemble(row, &mut tx).await?;
+        tx.commit().await?;
+        Ok(Some(result))
+    }
+
+    async fn set_lockdown(&self, id: Uuid, lockdown_override: Option<bool>, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let updated = sqlx::query("UPDATE ptn.simulation_templates SET lockdown_override = $2 WHERE public_id = $1")
+            .bind(id)
+            .bind(lockdown_override)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, TemplateRow>(&format!("SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t WHERE t.public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let result = self.assemble(row, &mut tx).await?;
+        tx.commit().await?;
+        Ok(Some(result))
+    }
+
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let result = sqlx::query("DELETE FROM ptn.simulation_templates WHERE public_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 AppError::from_sqlx_delete(
@@ -342,6 +423,7 @@ impl SimulationTemplateRepository for PostgresSimulationTemplateRepository {
                     "cannot delete this template: students already have simulation runs recorded against it",
                 )
             })?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -357,30 +439,32 @@ impl PostgresSimulationRunRepository {
         Self { pool }
     }
 
-    async fn slots_for_run(&self, run_id: Uuid) -> AppResult<Vec<SimulationRunSlot>> {
+    async fn slots_for_run(&self, run_id: i64, tx: &mut Transaction<'static, Postgres>) -> AppResult<Vec<SimulationRunSlot>> {
         let rows = sqlx::query_as::<_, RunSlotRow>(
-            r#"SELECT rs.id, rs.run_id, rs.sequence_index, rs.session_id, s.title AS session_title,
-                      s.duration_minutes, s.subject_filter, rs.break_seconds, rs.attempt_id,
+            r#"SELECT rs.public_id, r.public_id AS run_id, rs.sequence_index, s.public_id AS session_id,
+                      s.title AS session_title, s.duration_minutes, s.subject_filter, rs.break_seconds,
+                      a.public_id AS attempt_id,
                       a.score AS attempt_score, a.accuracy AS attempt_accuracy,
                       a.correct_count AS attempt_correct_count, a.wrong_count AS attempt_wrong_count,
                       a.unanswered_count AS attempt_unanswered_count,
                       rs.status, rs.deadline_at, rs.break_ends_at
-               FROM simulation_run_slots rs
-               JOIN tryout_sessions s ON s.id = rs.session_id
-               LEFT JOIN attempts a ON a.id = rs.attempt_id
+               FROM ptn.simulation_run_slots rs
+               JOIN ptn.simulation_runs r ON r.id = rs.run_id
+               JOIN ptn.tryout_sessions s ON s.id = rs.session_id
+               LEFT JOIN ptn.attempts a ON a.id = rs.attempt_id
                WHERE rs.run_id = $1
                ORDER BY rs.sequence_index ASC"#,
         )
         .bind(run_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
-    async fn assemble(&self, row: RunRow) -> AppResult<SimulationRun> {
-        let slots = self.slots_for_run(row.id).await?;
+    async fn assemble(&self, row: RunRow, tx: &mut Transaction<'static, Postgres>) -> AppResult<SimulationRun> {
+        let slots = self.slots_for_run(row.internal_id, tx).await?;
         Ok(SimulationRun {
-            id: row.id,
+            id: row.public_id,
             template_id: row.template_id,
             template_title: row.template_title,
             template_kind: parse_template_kind(&row.template_kind)?,
@@ -398,17 +482,20 @@ impl PostgresSimulationRunRepository {
 }
 
 const SELECT_RUN: &str = r#"
-    SELECT r.id, r.template_id, t.title AS template_title, t.template_kind, t.school_type_scope,
-           r.student_id, r.status,
-           r.current_sequence_index, r.combined_estimate_score, r.started_at, r.completed_at,
+    SELECT r.id, r.public_id, t.public_id AS template_id, t.title AS template_title, t.template_kind,
+           t.school_type_scope,
+           (SELECT public_id FROM core.akun WHERE core.akun.id = r.student_id) AS student_id,
+           r.status, r.current_sequence_index, r.combined_estimate_score, r.started_at, r.completed_at,
            r.lockdown_enabled
-    FROM simulation_runs r
-    JOIN simulation_templates t ON t.id = r.template_id
+    FROM ptn.simulation_runs r
+    JOIN ptn.simulation_templates t ON t.id = r.template_id
 "#;
 
 #[derive(sqlx::FromRow)]
 struct RunRow {
-    id: Uuid,
+    #[sqlx(rename = "id")]
+    internal_id: i64,
+    public_id: Uuid,
     template_id: Uuid,
     template_title: String,
     template_kind: String,
@@ -424,7 +511,7 @@ struct RunRow {
 
 #[derive(sqlx::FromRow)]
 struct RunSlotRow {
-    id: Uuid,
+    public_id: Uuid,
     run_id: Uuid,
     sequence_index: i32,
     session_id: Uuid,
@@ -447,7 +534,7 @@ impl TryFrom<RunSlotRow> for SimulationRunSlot {
     type Error = AppError;
     fn try_from(r: RunSlotRow) -> Result<Self, Self::Error> {
         Ok(SimulationRunSlot {
-            id: r.id,
+            id: r.public_id,
             run_id: r.run_id,
             sequence_index: r.sequence_index,
             session_id: r.session_id,
@@ -470,77 +557,109 @@ impl TryFrom<RunSlotRow> for SimulationRunSlot {
 
 #[async_trait]
 impl SimulationRunRepository for PostgresSimulationRunRepository {
-    async fn create(&self, input: NewSimulationRun) -> AppResult<SimulationRun> {
-        let id = Uuid::new_v4();
-        let mut tx = self.pool.begin().await?;
+    async fn create(&self, input: NewSimulationRun, ctx: &TenantCtx) -> AppResult<SimulationRun> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
 
-        sqlx::query(
-            r#"INSERT INTO simulation_runs (id, template_id, student_id, lockdown_enabled) VALUES ($1, $2, $3, $4)"#,
+        let template_id: i64 = sqlx::query_scalar("SELECT id FROM ptn.simulation_templates WHERE public_id = $1")
+            .bind(input.template_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let student_id: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(input.student_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let run_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO ptn.simulation_runs (tenant_id, template_id, student_id, lockdown_enabled)
+               VALUES ($1, $2, $3, $4) RETURNING id"#,
         )
-        .bind(id)
-        .bind(input.template_id)
-        .bind(input.student_id)
+        .bind(ctx.tenant_id)
+        .bind(template_id)
+        .bind(student_id)
         .bind(input.lockdown_enabled)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
 
         for slot in &input.slots {
+            let session_id: i64 = sqlx::query_scalar("SELECT id FROM ptn.tryout_sessions WHERE public_id = $1")
+                .bind(slot.session_id)
+                .fetch_one(&mut *tx)
+                .await?;
             sqlx::query(
-                r#"INSERT INTO simulation_run_slots (id, run_id, sequence_index, session_id, break_seconds)
-                   VALUES ($1, $2, $3, $4, $5)"#,
+                r#"INSERT INTO ptn.simulation_run_slots (run_id, sequence_index, session_id, break_seconds)
+                   VALUES ($1, $2, $3, $4)"#,
             )
-            .bind(Uuid::new_v4())
-            .bind(id)
+            .bind(run_id)
             .bind(slot.sequence_index)
-            .bind(slot.session_id)
+            .bind(session_id)
             .bind(slot.break_seconds)
             .execute(&mut *tx)
             .await?;
         }
 
+        let row = sqlx::query_as::<_, RunRow>(&format!("{SELECT_RUN} WHERE r.id = $1"))
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let result = self.assemble(row, &mut tx).await?;
         tx.commit().await?;
-
-        self.find_by_id(id)
-            .await?
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("simulation run vanished right after insert")))
+        Ok(result)
     }
 
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<SimulationRun>> {
-        let row = sqlx::query_as::<_, RunRow>(&format!("{SELECT_RUN} WHERE r.id = $1"))
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SimulationRun>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let row = sqlx::query_as::<_, RunRow>(&format!("{SELECT_RUN} WHERE r.public_id = $1"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         match row {
-            Some(r) => Ok(Some(self.assemble(r).await?)),
-            None => Ok(None),
+            Some(r) => {
+                let result = self.assemble(r, &mut tx).await?;
+                tx.commit().await?;
+                Ok(Some(result))
+            }
+            None => {
+                tx.commit().await?;
+                Ok(None)
+            }
         }
     }
 
-    async fn list_by_student(&self, student_id: Uuid) -> AppResult<Vec<SimulationRun>> {
+    async fn list_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<SimulationRun>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let rows = sqlx::query_as::<_, RunRow>(&format!(
-            "{SELECT_RUN} WHERE r.student_id = $1 ORDER BY r.started_at DESC"
+            "{SELECT_RUN} WHERE r.student_id = (SELECT id FROM core.akun WHERE public_id = $1) ORDER BY r.started_at DESC"
         ))
         .bind(student_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            out.push(self.assemble(row).await?);
+            out.push(self.assemble(row, &mut tx).await?);
         }
+        tx.commit().await?;
         Ok(out)
     }
 
-    async fn latest_completed_for_student(&self, student_id: Uuid) -> AppResult<Option<SimulationRun>> {
+    async fn latest_completed_for_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SimulationRun>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let row = sqlx::query_as::<_, RunRow>(&format!(
-            "{SELECT_RUN} WHERE r.student_id = $1 AND r.status = 'completed'
+            "{SELECT_RUN} WHERE r.student_id = (SELECT id FROM core.akun WHERE public_id = $1) AND r.status = 'completed'
              ORDER BY r.completed_at DESC LIMIT 1"
         ))
         .bind(student_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         match row {
-            Some(r) => Ok(Some(self.assemble(r).await?)),
-            None => Ok(None),
+            Some(r) => {
+                let result = self.assemble(r, &mut tx).await?;
+                tx.commit().await?;
+                Ok(Some(result))
+            }
+            None => {
+                tx.commit().await?;
+                Ok(None)
+            }
         }
     }
 
@@ -550,67 +669,82 @@ impl SimulationRunRepository for PostgresSimulationRunRepository {
         status: SimulationRunStatus,
         completed_at: Option<DateTime<Utc>>,
         combined_estimate_score: Option<f64>,
+        ctx: &TenantCtx,
     ) -> AppResult<()> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         sqlx::query(
-            r#"UPDATE simulation_runs SET status = $2, completed_at = $3, combined_estimate_score = $4
-               WHERE id = $1"#,
+            r#"UPDATE ptn.simulation_runs SET status = $2, completed_at = $3, combined_estimate_score = $4
+               WHERE public_id = $1"#,
         )
         .bind(run_id)
         .bind(run_status_str(status))
         .bind(completed_at)
         .bind(combined_estimate_score)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn advance_current_index(&self, run_id: Uuid, new_index: i32) -> AppResult<()> {
-        sqlx::query("UPDATE simulation_runs SET current_sequence_index = $2 WHERE id = $1")
+    async fn advance_current_index(&self, run_id: Uuid, new_index: i32, ctx: &TenantCtx) -> AppResult<()> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        sqlx::query("UPDATE ptn.simulation_runs SET current_sequence_index = $2 WHERE public_id = $1")
             .bind(run_id)
             .bind(new_index)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn activate_slot(&self, run_id: Uuid, sequence_index: i32, attempt_id: Uuid, deadline_at: DateTime<Utc>) -> AppResult<()> {
+    async fn activate_slot(&self, run_id: Uuid, sequence_index: i32, attempt_id: Uuid, deadline_at: DateTime<Utc>, ctx: &TenantCtx) -> AppResult<()> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let attempt_pk: i64 = sqlx::query_scalar("SELECT id FROM ptn.attempts WHERE public_id = $1")
+            .bind(attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
         sqlx::query(
-            r#"UPDATE simulation_run_slots SET status = $3, attempt_id = $4, deadline_at = $5
-               WHERE run_id = $1 AND sequence_index = $2"#,
+            r#"UPDATE ptn.simulation_run_slots SET status = $3, attempt_id = $4, deadline_at = $5
+               WHERE run_id = (SELECT id FROM ptn.simulation_runs WHERE public_id = $1) AND sequence_index = $2"#,
         )
         .bind(run_id)
         .bind(sequence_index)
         .bind(slot_status_str(SimulationSlotStatus::Active))
-        .bind(attempt_id)
+        .bind(attempt_pk)
         .bind(deadline_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn submit_slot(&self, run_id: Uuid, sequence_index: i32, break_ends_at: Option<DateTime<Utc>>) -> AppResult<()> {
+    async fn submit_slot(&self, run_id: Uuid, sequence_index: i32, break_ends_at: Option<DateTime<Utc>>, ctx: &TenantCtx) -> AppResult<()> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         sqlx::query(
-            r#"UPDATE simulation_run_slots SET status = $3, break_ends_at = $4
-               WHERE run_id = $1 AND sequence_index = $2"#,
+            r#"UPDATE ptn.simulation_run_slots SET status = $3, break_ends_at = $4
+               WHERE run_id = (SELECT id FROM ptn.simulation_runs WHERE public_id = $1) AND sequence_index = $2"#,
         )
         .bind(run_id)
         .bind(sequence_index)
         .bind(slot_status_str(SimulationSlotStatus::Submitted))
         .bind(break_ends_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn template_completion_stats(&self, template_id: Uuid) -> AppResult<TemplateCompletionStats> {
+    async fn template_completion_stats(&self, template_id: Uuid, ctx: &TenantCtx) -> AppResult<TemplateCompletionStats> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let row: (i64, Option<f64>) = sqlx::query_as(
             r#"SELECT COUNT(*), AVG(combined_estimate_score)
-               FROM simulation_runs
-               WHERE template_id = $1 AND status = 'completed'"#,
+               FROM ptn.simulation_runs
+               WHERE template_id = (SELECT id FROM ptn.simulation_templates WHERE public_id = $1) AND status = 'completed'"#,
         )
         .bind(template_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(TemplateCompletionStats { template_id, participant_count: row.0, avg_combined_score: row.1 })
     }
 }
@@ -629,7 +763,7 @@ impl PostgresLockdownViolationRepository {
 
 #[derive(sqlx::FromRow)]
 struct LockdownViolationRow {
-    id: Uuid,
+    public_id: Uuid,
     run_id: Uuid,
     student_id: Uuid,
     event_type: String,
@@ -640,7 +774,7 @@ struct LockdownViolationRow {
 impl From<LockdownViolationRow> for LockdownViolation {
     fn from(r: LockdownViolationRow) -> Self {
         LockdownViolation {
-            id: r.id,
+            id: r.public_id,
             run_id: r.run_id,
             student_id: r.student_id,
             event_type: r.event_type,
@@ -650,34 +784,57 @@ impl From<LockdownViolationRow> for LockdownViolation {
     }
 }
 
+const SELECT_VIOLATION: &str = r#"
+    SELECT v.public_id, r.public_id AS run_id,
+           (SELECT public_id FROM core.akun WHERE core.akun.id = v.student_id) AS student_id,
+           v.event_type, v.detail, v.occurred_at
+    FROM ptn.simulation_lockdown_violations v
+    JOIN ptn.simulation_runs r ON r.id = v.run_id
+"#;
+
 #[async_trait]
 impl LockdownViolationRepository for PostgresLockdownViolationRepository {
-    async fn record(&self, input: NewLockdownViolation) -> AppResult<LockdownViolation> {
-        let row = sqlx::query_as::<_, LockdownViolationRow>(
-            r#"INSERT INTO simulation_lockdown_violations (id, run_id, student_id, event_type, detail)
-               VALUES ($1, $2, $3, $4, $5)
-               RETURNING id, run_id, student_id, event_type, detail, occurred_at"#,
+    async fn record(&self, input: NewLockdownViolation, ctx: &TenantCtx) -> AppResult<LockdownViolation> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+
+        let run_id: i64 = sqlx::query_scalar("SELECT id FROM ptn.simulation_runs WHERE public_id = $1")
+            .bind(input.run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let student_id: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(input.student_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let public_id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO ptn.simulation_lockdown_violations (run_id, student_id, event_type, detail)
+               VALUES ($1, $2, $3, $4)
+               RETURNING public_id"#,
         )
-        .bind(Uuid::new_v4())
-        .bind(input.run_id)
-        .bind(input.student_id)
+        .bind(run_id)
+        .bind(student_id)
         .bind(&input.event_type)
         .bind(&input.detail)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        let row = sqlx::query_as::<_, LockdownViolationRow>(&format!("{SELECT_VIOLATION} WHERE v.public_id = $1"))
+            .bind(public_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(row.into())
     }
 
-    async fn list_by_run(&self, run_id: Uuid) -> AppResult<Vec<LockdownViolation>> {
-        let rows = sqlx::query_as::<_, LockdownViolationRow>(
-            r#"SELECT id, run_id, student_id, event_type, detail, occurred_at
-               FROM simulation_lockdown_violations
-               WHERE run_id = $1
-               ORDER BY occurred_at DESC"#,
-        )
+    async fn list_by_run(&self, run_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<LockdownViolation>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let rows = sqlx::query_as::<_, LockdownViolationRow>(&format!(
+            "{SELECT_VIOLATION} WHERE r.public_id = $1 ORDER BY v.occurred_at DESC"
+        ))
         .bind(run_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 }

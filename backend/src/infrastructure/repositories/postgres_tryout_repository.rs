@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::domain::package::ExamTrack;
@@ -9,9 +9,23 @@ use crate::domain::repository::{
     TryoutSessionRepository,
 };
 use crate::domain::school::SchoolType;
+use crate::domain::tenant::TenantCtx;
 use crate::domain::tryout::{Attempt, AttemptAnswer, AttemptStatus, SessionType, TryoutSession};
 use crate::error::{AppError, AppResult};
 use std::str::FromStr;
+
+/// Opens a transaction and sets the RLS GUCs on it — shared by both repositories in this
+/// file (`ptn.tryout_sessions`, `ptn.attempts`, and their child tables all carry RLS). See
+/// `postgres_user_repository.rs` for the canonical explanation of this pattern.
+async fn begin_tx(pool: &PgPool, ctx: &TenantCtx) -> AppResult<Transaction<'static, Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true), set_config('app.is_platform_admin', $2, true)")
+        .bind(ctx.tenant_id.to_string())
+        .bind(if ctx.is_platform_admin { "true" } else { "false" })
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
 
 // ─── Session templates ──────────────────────────────────────────────────────────
 
@@ -27,7 +41,7 @@ impl PostgresTryoutSessionRepository {
 
 #[derive(sqlx::FromRow)]
 struct SessionRow {
-    id: Uuid,
+    public_id: Uuid,
     title: String,
     session_type: String,
     duration_minutes: i32,
@@ -49,7 +63,7 @@ impl TryFrom<SessionRow> for TryoutSession {
     type Error = AppError;
     fn try_from(r: SessionRow) -> Result<Self, Self::Error> {
         Ok(TryoutSession {
-            id: r.id,
+            id: r.public_id,
             title: r.title,
             session_type: parse_session_type(&r.session_type)?,
             duration_minutes: r.duration_minutes,
@@ -79,29 +93,35 @@ fn school_type_scope_str(t: Option<SchoolType>) -> Option<&'static str> {
     t.map(|t| t.as_str())
 }
 
-// Shared column list for INSERT/UPDATE ... RETURNING clauses — plain `question_count`, since
-// right after a write the caller already knows what it just set (see NewSession::question_count
-// doc comment: cosmetic-only once question_set_id is set, never meant to be trusted long-term).
-const SESSION_COLUMNS: &str = r#"id, title, session_type, duration_minutes, question_count,
-                         subject_filter, topic_filter, difficulty_filter, is_premium,
-                         created_by, created_at, question_set_id, is_draft, is_elective, exam_track,
-                         school_type_scope"#;
+// `created_by`/`question_set_id` are resolved to their `public_id`s via scalar subqueries
+// (rather than JOINs) so this same column list works unmodified in both plain SELECTs and
+// INSERT/UPDATE ... RETURNING clauses (same pattern as `postgres_question_repository.rs`).
+const SESSION_COLUMNS: &str = r#"
+    public_id, title, session_type, duration_minutes, question_count,
+    subject_filter, topic_filter, difficulty_filter, is_premium,
+    (SELECT public_id FROM core.akun WHERE core.akun.id = ptn.tryout_sessions.created_by) AS created_by,
+    created_at,
+    (SELECT public_id FROM ptn.question_sets WHERE ptn.question_sets.id = ptn.tryout_sessions.question_set_id) AS question_set_id,
+    is_draft, is_elective, exam_track, school_type_scope
+"#;
 
 // Read-path variant (find_by_id / list) — a session pinned to a curated Set Soal
 // (question_set_id set) pulls its fixed question list from `question_set_items`, not the
 // random-filter draw, so its stored `question_count` column is cosmetic and was never
-// recalculated after questions were added/removed from the set (root cause of the "0 soal"
-// display bug on Set-Soal-based subtes cards even when the set has real questions). Catalog
-// reads compute the live count instead of trusting the stale stored value; sessions without a
-// question_set_id (random-filter draw) keep using the stored column as before.
-const SESSION_COLUMNS_LIVE: &str = r#"id, title, session_type, duration_minutes,
-                         CASE WHEN question_set_id IS NOT NULL
-                              THEN (SELECT count(*)::int FROM question_set_items qsi WHERE qsi.set_id = tryout_sessions.question_set_id)
-                              ELSE question_count
-                         END AS question_count,
-                         subject_filter, topic_filter, difficulty_filter, is_premium,
-                         created_by, created_at, question_set_id, is_draft, is_elective, exam_track,
-                         school_type_scope"#;
+// recalculated after questions were added/removed from the set. Catalog reads compute the
+// live count instead of trusting the stale stored value.
+const SESSION_COLUMNS_LIVE: &str = r#"
+    public_id, title, session_type, duration_minutes,
+    CASE WHEN question_set_id IS NOT NULL
+         THEN (SELECT count(*)::int FROM ptn.question_set_items qsi WHERE qsi.set_id = ptn.tryout_sessions.question_set_id)
+         ELSE question_count
+    END AS question_count,
+    subject_filter, topic_filter, difficulty_filter, is_premium,
+    (SELECT public_id FROM core.akun WHERE core.akun.id = ptn.tryout_sessions.created_by) AS created_by,
+    created_at,
+    (SELECT public_id FROM ptn.question_sets WHERE ptn.question_sets.id = ptn.tryout_sessions.question_set_id) AS question_set_id,
+    is_draft, is_elective, exam_track, school_type_scope
+"#;
 
 fn parse_session_type(s: &str) -> AppResult<SessionType> {
     match s {
@@ -137,17 +157,31 @@ fn parse_exam_track(s: &str) -> AppResult<ExamTrack> {
 
 #[async_trait]
 impl TryoutSessionRepository for PostgresTryoutSessionRepository {
-    async fn create(&self, n: NewSession) -> AppResult<TryoutSession> {
-        let id = Uuid::new_v4();
-        let row = sqlx::query_as::<_, SessionRow>(&format!(
-            r#"INSERT INTO tryout_sessions
-                (id, title, session_type, duration_minutes, question_count, subject_filter,
-                 topic_filter, difficulty_filter, is_premium, created_by, question_set_id, is_draft, is_elective, exam_track,
-                 school_type_scope)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-               RETURNING {SESSION_COLUMNS}"#
-        ))
-        .bind(id)
+    async fn create(&self, n: NewSession, ctx: &TenantCtx) -> AppResult<TryoutSession> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+
+        let created_by_id: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(n.created_by)
+            .fetch_one(&mut *tx)
+            .await?;
+        let question_set_id: Option<i64> = match n.question_set_id {
+            Some(qsid) => Some(
+                sqlx::query_scalar("SELECT id FROM ptn.question_sets WHERE public_id = $1")
+                    .bind(qsid)
+                    .fetch_one(&mut *tx)
+                    .await?,
+            ),
+            None => None,
+        };
+
+        let public_id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO ptn.tryout_sessions
+                (title, session_type, duration_minutes, question_count, subject_filter,
+                 topic_filter, difficulty_filter, is_premium, created_by, question_set_id, is_draft,
+                 is_elective, exam_track, school_type_scope)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+               RETURNING public_id"#,
+        )
         .bind(&n.title)
         .bind(session_type_str(n.session_type))
         .bind(n.duration_minutes)
@@ -156,59 +190,79 @@ impl TryoutSessionRepository for PostgresTryoutSessionRepository {
         .bind(&n.topic_filter)
         .bind(&n.difficulty_filter)
         .bind(n.is_premium)
-        .bind(n.created_by)
-        .bind(n.question_set_id)
+        .bind(created_by_id)
+        .bind(question_set_id)
         .bind(n.is_draft)
         .bind(n.is_elective)
         .bind(exam_track_str(n.exam_track))
         .bind(school_type_scope_str(n.school_type_scope))
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
 
+        let row = sqlx::query_as::<_, SessionRow>(&format!("SELECT {SESSION_COLUMNS} FROM ptn.tryout_sessions WHERE public_id = $1"))
+            .bind(public_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
         TryoutSession::try_from(row)
     }
 
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<TryoutSession>> {
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<TryoutSession>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let row = sqlx::query_as::<_, SessionRow>(&format!(
-            "SELECT {SESSION_COLUMNS_LIVE} FROM tryout_sessions WHERE id = $1"
+            "SELECT {SESSION_COLUMNS_LIVE} FROM ptn.tryout_sessions WHERE public_id = $1"
         ))
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         row.map(TryoutSession::try_from).transpose()
     }
 
-    async fn list(&self, session_type: Option<SessionType>) -> AppResult<Vec<TryoutSession>> {
+    async fn list(&self, session_type: Option<SessionType>, ctx: &TenantCtx) -> AppResult<Vec<TryoutSession>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let rows = match session_type {
             Some(t) => {
                 sqlx::query_as::<_, SessionRow>(&format!(
-                    "SELECT {SESSION_COLUMNS_LIVE} FROM tryout_sessions WHERE session_type = $1 ORDER BY created_at DESC"
+                    "SELECT {SESSION_COLUMNS_LIVE} FROM ptn.tryout_sessions WHERE session_type = $1 ORDER BY created_at DESC"
                 ))
                 .bind(session_type_str(t))
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?
             }
             None => {
                 sqlx::query_as::<_, SessionRow>(&format!(
-                    "SELECT {SESSION_COLUMNS_LIVE} FROM tryout_sessions ORDER BY created_at DESC"
+                    "SELECT {SESSION_COLUMNS_LIVE} FROM ptn.tryout_sessions ORDER BY created_at DESC"
                 ))
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?
             }
         };
+        tx.commit().await?;
         rows.into_iter().map(TryoutSession::try_from).collect()
     }
 
-    async fn update(&self, id: Uuid, u: SessionUpdate) -> AppResult<Option<TryoutSession>> {
-        let row = sqlx::query_as::<_, SessionRow>(&format!(
-            r#"UPDATE tryout_sessions SET
+    async fn update(&self, id: Uuid, u: SessionUpdate, ctx: &TenantCtx) -> AppResult<Option<TryoutSession>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+
+        let question_set_id: Option<i64> = match u.question_set_id {
+            Some(qsid) => Some(
+                sqlx::query_scalar("SELECT id FROM ptn.question_sets WHERE public_id = $1")
+                    .bind(qsid)
+                    .fetch_one(&mut *tx)
+                    .await?,
+            ),
+            None => None,
+        };
+
+        let updated = sqlx::query(
+            r#"UPDATE ptn.tryout_sessions SET
                 title = $2, session_type = $3, duration_minutes = $4, question_count = $5,
                 subject_filter = $6, topic_filter = $7, difficulty_filter = $8, is_premium = $9,
                 question_set_id = $10, is_draft = $11, is_elective = $12, exam_track = $13,
                 school_type_scope = $14
-               WHERE id = $1
-               RETURNING {SESSION_COLUMNS}"#
-        ))
+               WHERE public_id = $1"#,
+        )
         .bind(id)
         .bind(&u.title)
         .bind(session_type_str(u.session_type))
@@ -218,31 +272,50 @@ impl TryoutSessionRepository for PostgresTryoutSessionRepository {
         .bind(&u.topic_filter)
         .bind(&u.difficulty_filter)
         .bind(u.is_premium)
-        .bind(u.question_set_id)
+        .bind(question_set_id)
         .bind(u.is_draft)
         .bind(u.is_elective)
         .bind(exam_track_str(u.exam_track))
         .bind(school_type_scope_str(u.school_type_scope))
-        .fetch_optional(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        row.map(TryoutSession::try_from).transpose()
-    }
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
 
-    async fn set_draft(&self, id: Uuid, is_draft: bool) -> AppResult<Option<TryoutSession>> {
-        let row = sqlx::query_as::<_, SessionRow>(&format!(
-            "UPDATE tryout_sessions SET is_draft = $2 WHERE id = $1 RETURNING {SESSION_COLUMNS}"
-        ))
-        .bind(id)
-        .bind(is_draft)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(TryoutSession::try_from).transpose()
-    }
-
-    async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM tryout_sessions WHERE id = $1")
+        let row = sqlx::query_as::<_, SessionRow>(&format!("SELECT {SESSION_COLUMNS} FROM ptn.tryout_sessions WHERE public_id = $1"))
             .bind(id)
-            .execute(&self.pool)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        TryoutSession::try_from(row).map(Some)
+    }
+
+    async fn set_draft(&self, id: Uuid, is_draft: bool, ctx: &TenantCtx) -> AppResult<Option<TryoutSession>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let updated = sqlx::query("UPDATE ptn.tryout_sessions SET is_draft = $2 WHERE public_id = $1")
+            .bind(id)
+            .bind(is_draft)
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, SessionRow>(&format!("SELECT {SESSION_COLUMNS} FROM ptn.tryout_sessions WHERE public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        TryoutSession::try_from(row).map(Some)
+    }
+
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let result = sqlx::query("DELETE FROM ptn.tryout_sessions WHERE public_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 AppError::from_sqlx_delete(
@@ -250,6 +323,7 @@ impl TryoutSessionRepository for PostgresTryoutSessionRepository {
                     "cannot delete this session: students already have attempts recorded against it",
                 )
             })?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -268,7 +342,7 @@ impl PostgresAttemptRepository {
 
 #[derive(sqlx::FromRow)]
 struct AttemptRow {
-    id: Uuid,
+    public_id: Uuid,
     session_id: Uuid,
     session_title: String,
     session_type: String,
@@ -289,7 +363,7 @@ impl TryFrom<AttemptRow> for Attempt {
     type Error = AppError;
     fn try_from(r: AttemptRow) -> Result<Self, Self::Error> {
         Ok(Attempt {
-            id: r.id,
+            id: r.public_id,
             session_id: r.session_id,
             session_title: r.session_title,
             session_type: parse_session_type(&r.session_type)?,
@@ -309,17 +383,18 @@ impl TryFrom<AttemptRow> for Attempt {
 }
 
 const SELECT_ATTEMPT: &str = r#"
-    SELECT a.id, a.session_id, s.title AS session_title, s.session_type,
-           a.student_id, a.status, a.duration_minutes, a.started_at, a.submitted_at,
+    SELECT a.public_id, s.public_id AS session_id, s.title AS session_title, s.session_type,
+           (SELECT public_id FROM core.akun WHERE core.akun.id = a.student_id) AS student_id,
+           a.status, a.duration_minutes, a.started_at, a.submitted_at,
            a.score, a.accuracy, a.correct_count, a.wrong_count, a.unanswered_count,
            a.time_used_seconds
-    FROM attempts a
-    JOIN tryout_sessions s ON s.id = a.session_id
+    FROM ptn.attempts a
+    JOIN ptn.tryout_sessions s ON s.id = a.session_id
 "#;
 
 #[derive(sqlx::FromRow)]
 struct AnswerRow {
-    id: Uuid,
+    public_id: Uuid,
     attempt_id: Uuid,
     question_id: Uuid,
     answer_text: Option<String>,
@@ -331,7 +406,7 @@ struct AnswerRow {
 impl From<AnswerRow> for AttemptAnswer {
     fn from(r: AnswerRow) -> Self {
         AttemptAnswer {
-            id: r.id,
+            id: r.public_id,
             attempt_id: r.attempt_id,
             question_id: r.question_id,
             answer_text: r.answer_text,
@@ -342,67 +417,97 @@ impl From<AnswerRow> for AttemptAnswer {
     }
 }
 
+const SELECT_ANSWER: &str = r#"
+    SELECT aa.public_id, att.public_id AS attempt_id, q.public_id AS question_id,
+           aa.answer_text, aa.is_correct, aa.flagged, aa.answered_at
+    FROM ptn.attempt_answers aa
+    JOIN ptn.attempts att ON att.id = aa.attempt_id
+    JOIN ptn.questions q ON q.id = aa.question_id
+"#;
+
 #[async_trait]
 impl AttemptRepository for PostgresAttemptRepository {
-    async fn create(&self, n: NewAttempt) -> AppResult<Attempt> {
-        let id = Uuid::new_v4();
-        let mut tx = self.pool.begin().await?;
+    async fn create(&self, n: NewAttempt, ctx: &TenantCtx) -> AppResult<Attempt> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
 
-        sqlx::query(
-            r#"INSERT INTO attempts (id, session_id, student_id, duration_minutes)
-               VALUES ($1, $2, $3, $4)"#,
+        let session_id: i64 = sqlx::query_scalar("SELECT id FROM ptn.tryout_sessions WHERE public_id = $1")
+            .bind(n.session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let student_id: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(n.student_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let attempt_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO ptn.attempts (tenant_id, session_id, student_id, duration_minutes)
+               VALUES ($1, $2, $3, $4) RETURNING id"#,
         )
-        .bind(id)
-        .bind(n.session_id)
-        .bind(n.student_id)
+        .bind(ctx.tenant_id)
+        .bind(session_id)
+        .bind(student_id)
         .bind(n.duration_minutes)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
 
         for (idx, qid) in n.question_ids.iter().enumerate() {
+            let question_id: i64 = sqlx::query_scalar("SELECT id FROM ptn.questions WHERE public_id = $1")
+                .bind(qid)
+                .fetch_one(&mut *tx)
+                .await?;
             sqlx::query(
-                r#"INSERT INTO attempt_questions (attempt_id, question_id, order_index)
+                r#"INSERT INTO ptn.attempt_questions (attempt_id, question_id, order_index)
                    VALUES ($1, $2, $3)"#,
             )
-            .bind(id)
-            .bind(qid)
+            .bind(attempt_id)
+            .bind(question_id)
             .bind(idx as i32)
             .execute(&mut *tx)
             .await?;
         }
 
+        let row = sqlx::query_as::<_, AttemptRow>(&format!("{SELECT_ATTEMPT} WHERE a.id = $1"))
+            .bind(attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
         tx.commit().await?;
-
-        self.find_by_id(id)
-            .await?
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("attempt vanished right after insert")))
+        Attempt::try_from(row)
     }
 
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Attempt>> {
-        let row = sqlx::query_as::<_, AttemptRow>(&format!("{SELECT_ATTEMPT} WHERE a.id = $1"))
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Attempt>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let row = sqlx::query_as::<_, AttemptRow>(&format!("{SELECT_ATTEMPT} WHERE a.public_id = $1"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        tx.commit().await?;
         row.map(Attempt::try_from).transpose()
     }
 
-    async fn list_by_student(&self, student_id: Uuid) -> AppResult<Vec<Attempt>> {
+    async fn list_by_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Attempt>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let rows = sqlx::query_as::<_, AttemptRow>(&format!(
-            "{SELECT_ATTEMPT} WHERE a.student_id = $1 ORDER BY a.started_at DESC"
+            "{SELECT_ATTEMPT} WHERE a.student_id = (SELECT id FROM core.akun WHERE public_id = $1) ORDER BY a.started_at DESC"
         ))
         .bind(student_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         rows.into_iter().map(Attempt::try_from).collect()
     }
 
-    async fn question_ids_for_attempt(&self, attempt_id: Uuid) -> AppResult<Vec<Uuid>> {
+    async fn question_ids_for_attempt(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Uuid>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let ids: Vec<(Uuid,)> = sqlx::query_as(
-            "SELECT question_id FROM attempt_questions WHERE attempt_id = $1 ORDER BY order_index ASC",
+            r#"SELECT q.public_id FROM ptn.attempt_questions aq
+               JOIN ptn.questions q ON q.id = aq.question_id
+               JOIN ptn.attempts att ON att.id = aq.attempt_id
+               WHERE att.public_id = $1 ORDER BY aq.order_index ASC"#,
         )
         .bind(attempt_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ids.into_iter().map(|(id,)| id).collect())
     }
 
@@ -412,41 +517,58 @@ impl AttemptRepository for PostgresAttemptRepository {
         question_id: Uuid,
         answer_text: Option<String>,
         flagged: bool,
+        ctx: &TenantCtx,
     ) -> AppResult<AttemptAnswer> {
-        let row = sqlx::query_as::<_, AnswerRow>(
-            r#"INSERT INTO attempt_answers (id, attempt_id, question_id, answer_text, flagged, answered_at)
-               VALUES ($1, $2, $3, $4, $5, now())
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+
+        let attempt_pk: i64 = sqlx::query_scalar("SELECT id FROM ptn.attempts WHERE public_id = $1")
+            .bind(attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let question_pk: i64 = sqlx::query_scalar("SELECT id FROM ptn.questions WHERE public_id = $1")
+            .bind(question_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let answer_public_id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO ptn.attempt_answers (attempt_id, question_id, answer_text, flagged, answered_at)
+               VALUES ($1, $2, $3, $4, now())
                ON CONFLICT (attempt_id, question_id)
                DO UPDATE SET answer_text = EXCLUDED.answer_text, flagged = EXCLUDED.flagged, answered_at = now()
-               RETURNING id, attempt_id, question_id, answer_text, is_correct, flagged, answered_at"#,
+               RETURNING public_id"#,
         )
-        .bind(Uuid::new_v4())
-        .bind(attempt_id)
-        .bind(question_id)
+        .bind(attempt_pk)
+        .bind(question_pk)
         .bind(&answer_text)
         .bind(flagged)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        let row = sqlx::query_as::<_, AnswerRow>(&format!("{SELECT_ANSWER} WHERE aa.public_id = $1"))
+            .bind(answer_public_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(row.into())
     }
 
-    async fn answers_for_attempt(&self, attempt_id: Uuid) -> AppResult<Vec<AttemptAnswer>> {
-        let rows = sqlx::query_as::<_, AnswerRow>(
-            "SELECT id, attempt_id, question_id, answer_text, is_correct, flagged, answered_at
-             FROM attempt_answers WHERE attempt_id = $1",
-        )
-        .bind(attempt_id)
-        .fetch_all(&self.pool)
-        .await?;
+    async fn answers_for_attempt(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<AttemptAnswer>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let rows = sqlx::query_as::<_, AnswerRow>(&format!("{SELECT_ANSWER} WHERE att.public_id = $1"))
+            .bind(attempt_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    async fn submit(&self, attempt_id: Uuid, s: AttemptSubmission) -> AppResult<Attempt> {
+    async fn submit(&self, attempt_id: Uuid, s: AttemptSubmission, ctx: &TenantCtx) -> AppResult<Attempt> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         sqlx::query(
-            r#"UPDATE attempts SET
+            r#"UPDATE ptn.attempts SET
                 status = 'submitted', submitted_at = now(), score = $2, accuracy = $3,
                 correct_count = $4, wrong_count = $5, unanswered_count = $6, time_used_seconds = $7
-               WHERE id = $1"#,
+               WHERE public_id = $1"#,
         )
         .bind(attempt_id)
         .bind(s.score)
@@ -455,34 +577,43 @@ impl AttemptRepository for PostgresAttemptRepository {
         .bind(s.wrong_count)
         .bind(s.unanswered_count)
         .bind(s.time_used_seconds)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        self.find_by_id(attempt_id)
+        let row = sqlx::query_as::<_, AttemptRow>(&format!("{SELECT_ATTEMPT} WHERE a.public_id = $1"))
+            .bind(attempt_id)
+            .fetch_optional(&mut *tx)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("attempt {attempt_id} not found")))
+            .ok_or_else(|| AppError::NotFound(format!("attempt {attempt_id} not found")))?;
+        tx.commit().await?;
+        Attempt::try_from(row)
     }
 
-    async fn grade_answer(&self, answer_id: Uuid, is_correct: bool) -> AppResult<()> {
-        sqlx::query("UPDATE attempt_answers SET is_correct = $2 WHERE id = $1")
+    async fn grade_answer(&self, answer_id: Uuid, is_correct: bool, ctx: &TenantCtx) -> AppResult<()> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        sqlx::query("UPDATE ptn.attempt_answers SET is_correct = $2 WHERE public_id = $1")
             .bind(answer_id)
             .bind(is_correct)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn item_response_stats(&self) -> AppResult<Vec<ItemResponseStat>> {
+    async fn item_response_stats(&self, ctx: &TenantCtx) -> AppResult<Vec<ItemResponseStat>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let rows = sqlx::query_as::<_, ItemResponseStatRow>(
-            r#"SELECT question_id,
-                      COUNT(*) FILTER (WHERE is_correct = true) AS correct,
+            r#"SELECT q.public_id AS question_id,
+                      COUNT(*) FILTER (WHERE aa.is_correct = true) AS correct,
                       COUNT(*) AS total
-               FROM attempt_answers
-               WHERE is_correct IS NOT NULL
-               GROUP BY question_id"#,
+               FROM ptn.attempt_answers aa
+               JOIN ptn.questions q ON q.id = aa.question_id
+               WHERE aa.is_correct IS NOT NULL
+               GROUP BY q.public_id"#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 }

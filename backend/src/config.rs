@@ -3,6 +3,10 @@
 #[derive(Clone, Debug)]
 pub struct Config {
     pub database_url: String,
+    /// Narrow BYPASSRLS Postgres role, used ONLY for the first step of login (resolving
+    /// which tenant an email belongs to before `app.tenant_id` can be set) — see
+    /// `AuthService::login`.
+    pub auth_lookup_database_url: String,
     pub jwt_secret: String,
     pub jwt_expiry_hours: i64,
     pub server_host: String,
@@ -16,6 +20,8 @@ impl Config {
 
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
+        let auth_lookup_database_url = std::env::var("AUTH_LOOKUP_DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("AUTH_LOOKUP_DATABASE_URL must be set"))?;
         let jwt_secret = std::env::var("JWT_SECRET")
             .map_err(|_| anyhow::anyhow!("JWT_SECRET must be set"))?;
         let jwt_expiry_hours = std::env::var("JWT_EXPIRY_HOURS")
@@ -30,6 +36,7 @@ impl Config {
 
         Ok(Self {
             database_url,
+            auth_lookup_database_url,
             jwt_secret,
             jwt_expiry_hours,
             server_host,

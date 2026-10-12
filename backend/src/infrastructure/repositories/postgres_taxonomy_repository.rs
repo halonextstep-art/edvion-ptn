@@ -21,7 +21,7 @@ impl PostgresTaxonomyRepository {
 
 #[derive(sqlx::FromRow)]
 struct SubjectCategoryRow {
-    id: Uuid,
+    public_id: Uuid,
     name: String,
     description: String,
     sort_order: i32,
@@ -32,7 +32,7 @@ struct SubjectCategoryRow {
 impl From<SubjectCategoryRow> for SubjectCategory {
     fn from(r: SubjectCategoryRow) -> Self {
         SubjectCategory {
-            id: r.id,
+            id: r.public_id,
             name: r.name,
             description: r.description,
             sort_order: r.sort_order,
@@ -44,7 +44,7 @@ impl From<SubjectCategoryRow> for SubjectCategory {
 
 #[derive(sqlx::FromRow)]
 struct SubjectRow {
-    id: Uuid,
+    public_id: Uuid,
     category_id: Uuid,
     name: String,
     code: String,
@@ -56,7 +56,7 @@ struct SubjectRow {
 impl From<SubjectRow> for Subject {
     fn from(r: SubjectRow) -> Self {
         Subject {
-            id: r.id,
+            id: r.public_id,
             category_id: r.category_id,
             name: r.name,
             code: r.code,
@@ -67,14 +67,17 @@ impl From<SubjectRow> for Subject {
     }
 }
 
+// `ptn.subject_categories`/`ptn.subjects` carry no `tenant_id`/RLS — a shared platform-wide
+// catalogue (same as `ptn.institutions`/`ptn.ptn_programs`), so plain pool queries.
 const SELECT_CATEGORY: &str = r#"
-    SELECT id, name, description, sort_order, created_at, updated_at
-    FROM subject_categories
+    SELECT public_id, name, description, sort_order, created_at, updated_at
+    FROM ptn.subject_categories
 "#;
 
 const SELECT_SUBJECT: &str = r#"
-    SELECT id, category_id, name, code, sort_order, created_at, updated_at
-    FROM subjects
+    SELECT s.public_id, c.public_id AS category_id, s.name, s.code, s.sort_order, s.created_at, s.updated_at
+    FROM ptn.subjects s
+    JOIN ptn.subject_categories c ON c.id = s.category_id
 "#;
 
 #[async_trait]
@@ -83,7 +86,7 @@ impl TaxonomyRepository for PostgresTaxonomyRepository {
         let category_rows = sqlx::query_as::<_, SubjectCategoryRow>(&format!("{SELECT_CATEGORY} ORDER BY sort_order ASC, created_at ASC"))
             .fetch_all(&self.pool)
             .await?;
-        let subject_rows = sqlx::query_as::<_, SubjectRow>(&format!("{SELECT_SUBJECT} ORDER BY category_id ASC, sort_order ASC, created_at ASC"))
+        let subject_rows = sqlx::query_as::<_, SubjectRow>(&format!("{SELECT_SUBJECT} ORDER BY s.category_id ASC, s.sort_order ASC, s.created_at ASC"))
             .fetch_all(&self.pool)
             .await?;
 
@@ -106,17 +109,17 @@ impl TaxonomyRepository for PostgresTaxonomyRepository {
     }
 
     async fn create_category(&self, name: String, description: String, sort_order: i32) -> AppResult<SubjectCategory> {
-        let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO subject_categories (id, name, description, sort_order) VALUES ($1,$2,$3,$4)")
-            .bind(id)
-            .bind(&name)
-            .bind(&description)
-            .bind(sort_order)
-            .execute(&self.pool)
-            .await?;
+        let public_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO ptn.subject_categories (name, description, sort_order) VALUES ($1,$2,$3) RETURNING public_id",
+        )
+        .bind(&name)
+        .bind(&description)
+        .bind(sort_order)
+        .fetch_one(&self.pool)
+        .await?;
 
-        let row = sqlx::query_as::<_, SubjectCategoryRow>(&format!("{SELECT_CATEGORY} WHERE id = $1"))
-            .bind(id)
+        let row = sqlx::query_as::<_, SubjectCategoryRow>(&format!("{SELECT_CATEGORY} WHERE public_id = $1"))
+            .bind(public_id)
             .fetch_one(&self.pool)
             .await?;
         Ok(row.into())
@@ -130,7 +133,7 @@ impl TaxonomyRepository for PostgresTaxonomyRepository {
         sort_order: i32,
     ) -> AppResult<Option<SubjectCategory>> {
         let result = sqlx::query(
-            "UPDATE subject_categories SET name = $2, description = $3, sort_order = $4, updated_at = now() WHERE id = $1",
+            "UPDATE ptn.subject_categories SET name = $2, description = $3, sort_order = $4, updated_at = now() WHERE public_id = $1",
         )
         .bind(id)
         .bind(&name)
@@ -142,7 +145,7 @@ impl TaxonomyRepository for PostgresTaxonomyRepository {
         if result.rows_affected() == 0 {
             return Ok(None);
         }
-        let row = sqlx::query_as::<_, SubjectCategoryRow>(&format!("{SELECT_CATEGORY} WHERE id = $1"))
+        let row = sqlx::query_as::<_, SubjectCategoryRow>(&format!("{SELECT_CATEGORY} WHERE public_id = $1"))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -150,7 +153,7 @@ impl TaxonomyRepository for PostgresTaxonomyRepository {
     }
 
     async fn delete_category(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM subject_categories WHERE id = $1")
+        let result = sqlx::query("DELETE FROM ptn.subject_categories WHERE public_id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -158,25 +161,29 @@ impl TaxonomyRepository for PostgresTaxonomyRepository {
     }
 
     async fn create_subject(&self, category_id: Uuid, name: String, code: String, sort_order: i32) -> AppResult<Subject> {
-        let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO subjects (id, category_id, name, code, sort_order) VALUES ($1,$2,$3,$4,$5)")
-            .bind(id)
+        let category_pk: i64 = sqlx::query_scalar("SELECT id FROM ptn.subject_categories WHERE public_id = $1")
             .bind(category_id)
-            .bind(&name)
-            .bind(&code)
-            .bind(sort_order)
-            .execute(&self.pool)
+            .fetch_one(&self.pool)
             .await?;
+        let public_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO ptn.subjects (category_id, name, code, sort_order) VALUES ($1,$2,$3,$4) RETURNING public_id",
+        )
+        .bind(category_pk)
+        .bind(&name)
+        .bind(&code)
+        .bind(sort_order)
+        .fetch_one(&self.pool)
+        .await?;
 
-        let row = sqlx::query_as::<_, SubjectRow>(&format!("{SELECT_SUBJECT} WHERE id = $1"))
-            .bind(id)
+        let row = sqlx::query_as::<_, SubjectRow>(&format!("{SELECT_SUBJECT} WHERE s.public_id = $1"))
+            .bind(public_id)
             .fetch_one(&self.pool)
             .await?;
         Ok(row.into())
     }
 
     async fn update_subject(&self, id: Uuid, name: String, code: String, sort_order: i32) -> AppResult<Option<Subject>> {
-        let result = sqlx::query("UPDATE subjects SET name = $2, code = $3, sort_order = $4, updated_at = now() WHERE id = $1")
+        let result = sqlx::query("UPDATE ptn.subjects SET name = $2, code = $3, sort_order = $4, updated_at = now() WHERE public_id = $1")
             .bind(id)
             .bind(&name)
             .bind(&code)
@@ -187,7 +194,7 @@ impl TaxonomyRepository for PostgresTaxonomyRepository {
         if result.rows_affected() == 0 {
             return Ok(None);
         }
-        let row = sqlx::query_as::<_, SubjectRow>(&format!("{SELECT_SUBJECT} WHERE id = $1"))
+        let row = sqlx::query_as::<_, SubjectRow>(&format!("{SELECT_SUBJECT} WHERE s.public_id = $1"))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -195,7 +202,7 @@ impl TaxonomyRepository for PostgresTaxonomyRepository {
     }
 
     async fn delete_subject(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM subjects WHERE id = $1")
+        let result = sqlx::query("DELETE FROM ptn.subjects WHERE public_id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;

@@ -135,7 +135,7 @@ impl SimulationService {
                     AppError::Validation("slot bukan mapel pilihan wajib memiliki sesi tetap".to_string())
                 })?;
                 self.sessions
-                    .find_by_id(session_id)
+                    .find_by_id(session_id, &actor.tenant)
                     .await?
                     .ok_or_else(|| AppError::NotFound(format!("session {session_id} not found")))?;
             }
@@ -149,7 +149,7 @@ impl SimulationService {
             })?;
             let pkg = self
                 .packages
-                .find_by_id(package_id)
+                .find_by_id(package_id, &actor.tenant)
                 .await?
                 .ok_or_else(|| AppError::NotFound(format!("package {package_id} not found")))?;
             if pkg.elective_pick_count as usize != elective_slot_count {
@@ -184,7 +184,7 @@ impl SimulationService {
                 exam_track: input.exam_track,
                 school_type_scope: input.school_type_scope,
                 lockdown_override: input.lockdown_override,
-            })
+            }, &actor.tenant)
             .await
     }
 
@@ -198,7 +198,7 @@ impl SimulationService {
     ) -> AppResult<SimulationTemplate> {
         actor.require_role(&[Role::Admin])?;
         self.templates
-            .set_lockdown(id, lockdown_override)
+            .set_lockdown(id, lockdown_override, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("template {id} not found")))
     }
@@ -215,15 +215,15 @@ impl SimulationService {
     /// students unaffected by either rule.
     pub async fn list_templates(&self, actor: &AuthUser) -> AppResult<Vec<SimulationTemplate>> {
         match actor.role {
-            Role::Admin => self.templates.list(false).await,
+            Role::Admin => self.templates.list(false, &actor.tenant).await,
             Role::Content => {
-                let all = self.templates.list(false).await?;
+                let all = self.templates.list(false, &actor.tenant).await?;
                 Ok(all.into_iter().filter(|t| !t.is_draft || t.created_by == actor.user_id).collect())
             }
             Role::Student => {
-                let all = self.templates.list(true).await?;
+                let all = self.templates.list(true, &actor.tenant).await?;
                 let mut visible: Vec<SimulationTemplate> = all.into_iter().filter(|t| !t.is_draft).collect();
-                if let Some(student_type) = self.access.student_school_type(actor.user_id).await? {
+                if let Some(student_type) = self.access.student_school_type(actor.user_id, &actor.tenant).await? {
                     visible.retain(|t| match t.school_type_scope {
                         None => true,
                         Some(scope) => scope == student_type,
@@ -241,7 +241,7 @@ impl SimulationService {
     pub async fn set_template_active(&self, actor: &AuthUser, id: Uuid, active: bool) -> AppResult<SimulationTemplate> {
         actor.require_role(&[Role::Admin])?;
         self.templates
-            .set_active(id, active)
+            .set_active(id, active, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("template {id} not found")))
     }
@@ -249,16 +249,16 @@ impl SimulationService {
     pub async fn set_template_premium(&self, actor: &AuthUser, id: Uuid, is_premium: bool) -> AppResult<SimulationTemplate> {
         actor.require_role(&[Role::Admin])?;
         self.templates
-            .set_premium(id, is_premium)
+            .set_premium(id, is_premium, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("template {id} not found")))
     }
 
     /// Called directly by `PackageService::set_active`'s publish cascade and by an owner
     /// manually un-hiding/re-hiding their own draft template.
-    pub async fn set_template_draft(&self, id: Uuid, is_draft: bool) -> AppResult<SimulationTemplate> {
+    pub async fn set_template_draft(&self, id: Uuid, is_draft: bool, ctx: &crate::domain::tenant::TenantCtx) -> AppResult<SimulationTemplate> {
         self.templates
-            .set_draft(id, is_draft)
+            .set_draft(id, is_draft, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("template {id} not found")))
     }
@@ -268,14 +268,14 @@ impl SimulationService {
         if actor.role != Role::Admin {
             let existing = self
                 .templates
-                .find_by_id(id)
+                .find_by_id(id, &actor.tenant)
                 .await?
                 .ok_or_else(|| AppError::NotFound(format!("template {id} not found")))?;
             if existing.created_by != actor.user_id {
                 return Err(AppError::Forbidden("Anda hanya bisa menghapus simulasi yang Anda buat sendiri".to_string()));
             }
         }
-        if !self.templates.delete(id).await? {
+        if !self.templates.delete(id, &actor.tenant).await? {
             return Err(AppError::NotFound(format!("template {id} not found")));
         }
         Ok(())
@@ -283,7 +283,7 @@ impl SimulationService {
 
     pub async fn start_run(&self, actor: &AuthUser, template_id: Uuid) -> AppResult<SimulationRunWithQuestions> {
         actor.require_role(&[Role::Student])?;
-        let existing = self.runs.list_by_student(actor.user_id).await?;
+        let existing = self.runs.list_by_student(actor.user_id, &actor.tenant).await?;
         // Every Simulasi TO template can only be COMPLETED once per student — it's a formal,
         // timed mock exam (not a repeatable drill like Latihan/Drilling), so a finished run
         // permanently blocks starting a fresh one for the same template. `myRuns`/"Riwayat
@@ -324,7 +324,7 @@ impl SimulationService {
                         .unwrap_or(false);
                     if stuck_pending {
                         self.runs
-                            .set_run_status(reconciled.id, SimulationRunStatus::Abandoned, Some(Utc::now()), None)
+                            .set_run_status(reconciled.id, SimulationRunStatus::Abandoned, Some(Utc::now()), None, &actor.tenant)
                             .await?;
                     } else {
                         return Err(AppError::Validation(
@@ -337,13 +337,13 @@ impl SimulationService {
         }
         let template = self
             .templates
-            .find_by_id(template_id)
+            .find_by_id(template_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("template {template_id} not found")))?;
         if !template.is_active {
             return Err(AppError::Validation("template simulasi ini tidak aktif".to_string()));
         }
-        if template.is_premium && !self.access.has_access_to_simulation_template(actor.user_id, template_id).await? {
+        if template.is_premium && !self.access.has_access_to_simulation_template(actor.user_id, template_id, &actor.tenant).await? {
             return Err(AppError::Forbidden(
                 "simulasi ini khusus siswa dengan akses premium (voucher pribadi atau paket sekolah aktif)".to_string(),
             ));
@@ -392,7 +392,7 @@ impl SimulationService {
         // rather than being a cosmetic card layered on top of a clock that's already ticking.
         let run = self
             .runs
-            .create(NewSimulationRun { template_id, student_id: actor.user_id, slots: run_slots, lockdown_enabled })
+            .create(NewSimulationRun { template_id, student_id: actor.user_id, slots: run_slots, lockdown_enabled }, &actor.tenant)
             .await?;
         self.get_run(actor, run.id).await
     }
@@ -406,7 +406,7 @@ impl SimulationService {
         actor.require_role(&[Role::Student])?;
         let run = self
             .runs
-            .find_by_id(run_id)
+            .find_by_id(run_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
         self.ensure_owned(actor, &run)?;
@@ -429,7 +429,7 @@ impl SimulationService {
     pub async fn get_run(&self, actor: &AuthUser, run_id: Uuid) -> AppResult<SimulationRunWithQuestions> {
         let mut run = self
             .runs
-            .find_by_id(run_id)
+            .find_by_id(run_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
         self.ensure_owned(actor, &run)?;
@@ -446,7 +446,7 @@ impl SimulationService {
         actor.require_role(&[Role::Student])?;
         let run = self
             .runs
-            .find_by_id(run_id)
+            .find_by_id(run_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
         self.ensure_owned(actor, &run)?;
@@ -485,7 +485,7 @@ impl SimulationService {
         actor.require_role(&[Role::Student])?;
         let run = self
             .runs
-            .find_by_id(run_id)
+            .find_by_id(run_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
         self.ensure_owned(actor, &run)?;
@@ -529,7 +529,7 @@ impl SimulationService {
         actor.require_role(&[Role::Student])?;
         let run = self
             .runs
-            .find_by_id(run_id)
+            .find_by_id(run_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
         self.ensure_owned(actor, &run)?;
@@ -537,7 +537,7 @@ impl SimulationService {
             return Err(AppError::Validation("simulasi ini sudah tidak sedang berjalan".to_string()));
         }
         self.runs
-            .set_run_status(run_id, SimulationRunStatus::Abandoned, Some(Utc::now()), None)
+            .set_run_status(run_id, SimulationRunStatus::Abandoned, Some(Utc::now()), None, &actor.tenant)
             .await
     }
 
@@ -548,15 +548,15 @@ impl SimulationService {
     pub async fn template_stats(&self, actor: &AuthUser, template_id: Uuid) -> AppResult<TemplateCompletionStats> {
         actor.require_role(&[Role::Student, Role::Admin])?;
         self.templates
-            .find_by_id(template_id)
+            .find_by_id(template_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("template {template_id} not found")))?;
-        self.runs.template_completion_stats(template_id).await
+        self.runs.template_completion_stats(template_id, &crate::domain::tenant::TenantCtx::platform_admin()).await
     }
 
     pub async fn list_my_runs(&self, actor: &AuthUser) -> AppResult<Vec<SimulationRun>> {
         actor.require_role(&[Role::Student])?;
-        self.runs.list_by_student(actor.user_id).await
+        self.runs.list_by_student(actor.user_id, &actor.tenant).await
     }
 
     /// Admin-only equivalent of `list_my_runs`, scoped to any student — see
@@ -564,7 +564,7 @@ impl SimulationService {
     /// (previously there was NO way for Admin to see a student's in-progress Simulasi run).
     pub async fn admin_list_runs(&self, actor: &AuthUser, student_id: Uuid) -> AppResult<Vec<SimulationRun>> {
         actor.require_role(&[Role::Admin])?;
-        self.runs.list_by_student(student_id).await
+        self.runs.list_by_student(student_id, &actor.tenant).await
     }
 
     /// Called by the "Mode Terkunci" frontend enforcement in the Simulasi TO player whenever it
@@ -582,12 +582,12 @@ impl SimulationService {
         actor.require_role(&[Role::Student])?;
         let run = self
             .runs
-            .find_by_id(run_id)
+            .find_by_id(run_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
         self.ensure_owned(actor, &run)?;
         self.violations
-            .record(NewLockdownViolation { run_id, student_id: actor.user_id, event_type, detail })
+            .record(NewLockdownViolation { run_id, student_id: actor.user_id, event_type, detail }, &actor.tenant)
             .await
     }
 
@@ -597,11 +597,11 @@ impl SimulationService {
     pub async fn list_violations(&self, actor: &AuthUser, run_id: Uuid) -> AppResult<Vec<LockdownViolation>> {
         let run = self
             .runs
-            .find_by_id(run_id)
+            .find_by_id(run_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
         self.ensure_owned(actor, &run)?;
-        self.violations.list_by_run(run_id).await
+        self.violations.list_by_run(run_id, &actor.tenant).await
     }
 
     // ── internals ──
@@ -616,7 +616,7 @@ impl SimulationService {
     async fn activate_slot(&self, actor: &AuthUser, run_id: Uuid, sequence_index: i32) -> AppResult<()> {
         let run = self
             .runs
-            .find_by_id(run_id)
+            .find_by_id(run_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("run {run_id} vanished")))?;
         let slot = run
@@ -626,7 +626,7 @@ impl SimulationService {
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("slot {sequence_index} not found on run {run_id}")))?;
         let attempt_with_q = self.tryout.start_attempt_for_simulation(actor, slot.session_id).await?;
         let deadline = Utc::now() + Duration::minutes(attempt_with_q.attempt.duration_minutes as i64);
-        self.runs.activate_slot(run_id, sequence_index, attempt_with_q.attempt.id, deadline).await
+        self.runs.activate_slot(run_id, sequence_index, attempt_with_q.attempt.id, deadline, &actor.tenant).await
     }
 
     /// Called right after an attempt has just been submitted (either manually via
@@ -644,19 +644,19 @@ impl SimulationService {
     ) -> AppResult<SimulationRun> {
         let is_last_slot = slot.sequence_index >= run.slots.len() as i32;
         if is_last_slot {
-            self.runs.submit_slot(run.id, slot.sequence_index, None).await?;
+            self.runs.submit_slot(run.id, slot.sequence_index, None, &actor.tenant).await?;
             let run = self
                 .runs
-                .find_by_id(run.id)
+                .find_by_id(run.id, &actor.tenant)
                 .await?
                 .ok_or_else(|| AppError::Internal(anyhow::anyhow!("run {} vanished after final submit", run.id)))?;
             // Go straight to finishing — no break to wait out on the last slot.
             self.advance_to_next(actor, run).await
         } else {
             let break_ends = Utc::now() + Duration::seconds(slot.break_seconds as i64);
-            self.runs.submit_slot(run.id, slot.sequence_index, Some(break_ends)).await?;
+            self.runs.submit_slot(run.id, slot.sequence_index, Some(break_ends), &actor.tenant).await?;
             self.runs
-                .find_by_id(run.id)
+                .find_by_id(run.id, &actor.tenant)
                 .await?
                 .ok_or_else(|| AppError::Internal(anyhow::anyhow!("run {} vanished after submit", run.id)))
         }
@@ -708,11 +708,11 @@ impl SimulationService {
         if next_seq > run.slots.len() as i32 {
             self.finish_run(actor, &run).await?;
         } else {
-            self.runs.advance_current_index(run.id, next_seq).await?;
+            self.runs.advance_current_index(run.id, next_seq, &actor.tenant).await?;
             self.activate_slot(actor, run.id, next_seq).await?;
         }
         self.runs
-            .find_by_id(run.id)
+            .find_by_id(run.id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("run {} vanished after advance", run.id)))
     }
@@ -730,7 +730,7 @@ impl SimulationService {
     async fn finish_run(&self, actor: &AuthUser, run: &SimulationRun) -> AppResult<()> {
         const UTBK_SCALE_MAX: f64 = 825.0;
         const PLATFORM_SCALE_MAX: f64 = 1000.0;
-        let template = self.templates.find_by_id(run.template_id).await?;
+        let template = self.templates.find_by_id(run.template_id, &actor.tenant).await?;
         let should_combine = template
             .map(|t| t.template_kind == SimulationTemplateKind::UtbkCombined)
             .unwrap_or(true);
@@ -755,7 +755,7 @@ impl SimulationService {
             }
         };
         self.runs
-            .set_run_status(run.id, SimulationRunStatus::Completed, Some(Utc::now()), combined)
+            .set_run_status(run.id, SimulationRunStatus::Completed, Some(Utc::now()), combined, &actor.tenant)
             .await
     }
 

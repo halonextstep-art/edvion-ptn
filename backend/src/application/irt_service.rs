@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::domain::irt::{calibrate_difficulty, estimate_theta, theta_to_display_score, MIN_ITEM_SAMPLE_SIZE};
 use crate::domain::repository::{AttemptRepository, QuestionIrtParamRepository};
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::error::AppResult;
 use crate::interfaces::http::middleware::AuthUser;
@@ -45,7 +46,10 @@ impl IrtService {
     /// button; there is no automatic re-run.
     pub async fn recalibrate(&self, actor: &AuthUser) -> AppResult<RecalibrationSummary> {
         actor.require_role(&[Role::Admin])?;
-        let stats = self.attempts.item_response_stats().await?;
+        // Platform-wide aggregate across every tenant's graded answers — not scoped to the
+        // caller's own tenant even though the caller must be an Admin (see
+        // `AttemptRepository::item_response_stats` doc comment).
+        let stats = self.attempts.item_response_stats(&TenantCtx::platform_admin()).await?;
         let mut to_upsert = Vec::new();
         let mut skipped = 0i64;
         for stat in stats {

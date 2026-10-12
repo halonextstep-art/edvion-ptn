@@ -31,6 +31,7 @@ use crate::domain::repository::{
     SchoolEligibilityUpsert, SimulationRunRepository, SnbpParticipationRepository, SnbpParticipationUpsert,
     SnbtTrackingRepository, SnbtTrackingUpsert, UserFilter, UserRepository,
 };
+use crate::domain::tenant::TenantCtx;
 use crate::domain::tryout::Attempt;
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
@@ -224,14 +225,14 @@ impl SchoolRationalizationService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
-        let participation = self.snbp_participation.list_by_school(school_id).await?;
+        let participation = self.snbp_participation.list_by_school(school_id, &actor.tenant).await?;
         let current_year = Utc::now().year();
 
         let mut out = Vec::with_capacity(students.len());
         for student in &students {
-            let targets = self.ptn_targets.list_by_student(student.id).await?;
+            let targets = self.ptn_targets.list_by_student(student.id, &actor.tenant).await?;
             let snbp_targets: Vec<_> = targets.into_iter().filter(|t| t.track == Track::Snbp).collect();
 
             let mut pilihan_1 = None;
@@ -273,7 +274,7 @@ impl SchoolRationalizationService {
     ) -> AppResult<SnbpRosterRow> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.ensure_owns_student(school_id, student_id).await?;
+        self.ensure_owns_student(school_id, student_id, &actor.tenant).await?;
 
         self.snbp_participation
             .upsert(
@@ -285,6 +286,7 @@ impl SchoolRationalizationService {
                     status: input.status,
                     aktif: input.aktif,
                 },
+                &actor.tenant,
             )
             .await?;
 
@@ -298,10 +300,10 @@ impl SchoolRationalizationService {
     /// Confirms `student_id` actually belongs to this school before letting the PIC write
     /// roster metadata for them — mirrors the check already used by the shared SNBP editor's
     /// school-on-behalf routes (`authorize_student_edit` in the rationalization handler).
-    async fn ensure_owns_student(&self, school_id: Uuid, student_id: Uuid) -> AppResult<()> {
+    async fn ensure_owns_student(&self, school_id: Uuid, student_id: Uuid, ctx: &TenantCtx) -> AppResult<()> {
         let student = self
             .users
-            .find_by_id(student_id)
+            .find_by_id(student_id, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("siswa {student_id} tidak ditemukan")))?;
         if student.school_id != Some(school_id) {
@@ -317,10 +319,10 @@ impl SchoolRationalizationService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
 
-        let (ranking, uni_counts, chance_sum, chance_count) = self.snbp_ranking_for(&students).await?;
+        let (ranking, uni_counts, chance_sum, chance_count) = self.snbp_ranking_for(&students, &actor.tenant).await?;
 
         let mut top: Vec<StudentChanceSummary> = ranking
             .iter()
@@ -340,7 +342,7 @@ impl SchoolRationalizationService {
 
         let eligible_terbaru = self
             .eligibility
-            .list_by_school(school_id)
+            .list_by_school(school_id, &actor.tenant)
             .await?
             .into_iter()
             .max_by_key(|e| e.year);
@@ -363,9 +365,9 @@ impl SchoolRationalizationService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
-        let (ranking, _, _, _) = self.snbp_ranking_for(&students).await?;
+        let (ranking, _, _, _) = self.snbp_ranking_for(&students, &actor.tenant).await?;
         Ok(ranking)
     }
 
@@ -377,6 +379,7 @@ impl SchoolRationalizationService {
     async fn snbp_ranking_for(
         &self,
         students: &[crate::domain::user::User],
+        ctx: &TenantCtx,
     ) -> AppResult<(Vec<SnbpRankingEntry>, HashMap<String, i64>, f64, i64)> {
         let mut uni_counts: HashMap<String, i64> = HashMap::new();
         let mut chance_sum = 0.0;
@@ -384,14 +387,14 @@ impl SchoolRationalizationService {
         let mut ranking: Vec<SnbpRankingEntry> = Vec::new();
 
         for student in students {
-            let targets = self.ptn_targets.list_by_student(student.id).await?;
+            let targets = self.ptn_targets.list_by_student(student.id, ctx).await?;
             let snbp_targets: Vec<_> = targets.into_iter().filter(|t| t.track == Track::Snbp).collect();
             if snbp_targets.is_empty() {
                 continue;
             }
-            let rapor = self.rapor.list_by_student(student.id).await?;
+            let rapor = self.rapor.list_by_student(student.id, ctx).await?;
             let rapor_avg = average_rapor(&rapor);
-            let achievements = self.achievements.list_by_student(student.id).await?;
+            let achievements = self.achievements.list_by_student(student.id, ctx).await?;
             let prestasi_bonus = index_prestasi(&achievements);
 
             let mut best: Option<(f64, ChanceTier)> = None;
@@ -437,7 +440,7 @@ impl SchoolRationalizationService {
     pub async fn list_alumni(&self, actor: &AuthUser) -> AppResult<Vec<AlumniBenchmark>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.alumni.list_by_school(school_id).await
+        self.alumni.list_by_school(school_id, &actor.tenant).await
     }
 
     pub async fn add_alumni(&self, actor: &AuthUser, input: AddAlumniInput) -> AppResult<AlumniBenchmark> {
@@ -450,23 +453,26 @@ impl SchoolRationalizationService {
             return Err(AppError::Validation("nama PTN dan program studi wajib diisi".to_string()));
         }
         self.alumni
-            .create(NewAlumniBenchmark {
-                school_id,
-                alumni_name: input.alumni_name,
-                graduation_year: input.graduation_year,
-                track: input.track,
-                nama_ptn: input.nama_ptn,
-                nama_prodi: input.nama_prodi,
-                benchmark_score: input.benchmark_score,
-                created_by: actor.user_id,
-            })
+            .create(
+                NewAlumniBenchmark {
+                    school_id,
+                    alumni_name: input.alumni_name,
+                    graduation_year: input.graduation_year,
+                    track: input.track,
+                    nama_ptn: input.nama_ptn,
+                    nama_prodi: input.nama_prodi,
+                    benchmark_score: input.benchmark_score,
+                    created_by: actor.user_id,
+                },
+                &actor.tenant,
+            )
             .await
     }
 
     pub async fn delete_alumni(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        let deleted = self.alumni.delete(school_id, id).await?;
+        let deleted = self.alumni.delete(school_id, id, &actor.tenant).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("data alumni {id} tidak ditemukan")));
         }
@@ -476,10 +482,10 @@ impl SchoolRationalizationService {
     /// Verifikasi `alumni_id` benar-benar milik sekolah actor sebelum baca/tulis "Detail
     /// Rapor"-nya — mencegah PIC sekolah lain menebak UUID alumni sekolah lain untuk
     /// membaca/menimpa detail nilainya.
-    async fn ensure_owns_alumni(&self, school_id: Uuid, alumni_id: Uuid) -> AppResult<()> {
+    async fn ensure_owns_alumni(&self, school_id: Uuid, alumni_id: Uuid, ctx: &TenantCtx) -> AppResult<()> {
         let alumni = self
             .alumni
-            .find_by_id(alumni_id)
+            .find_by_id(alumni_id, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("data alumni {alumni_id} tidak ditemukan")))?;
         if alumni.school_id != school_id {
@@ -491,8 +497,8 @@ impl SchoolRationalizationService {
     pub async fn list_alumni_rapor(&self, actor: &AuthUser, alumni_id: Uuid) -> AppResult<Vec<AlumniRaporScore>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.ensure_owns_alumni(school_id, alumni_id).await?;
-        self.alumni.list_rapor(alumni_id).await
+        self.ensure_owns_alumni(school_id, alumni_id, &actor.tenant).await?;
+        self.alumni.list_rapor(alumni_id, &actor.tenant).await
     }
 
     /// Batch upsert "Detail Rapor" alumni — sama pola dengan `RaporScoreRepository::upsert`
@@ -506,7 +512,7 @@ impl SchoolRationalizationService {
     ) -> AppResult<Vec<AlumniRaporScore>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.ensure_owns_alumni(school_id, alumni_id).await?;
+        self.ensure_owns_alumni(school_id, alumni_id, &actor.tenant).await?;
         let mut saved = Vec::with_capacity(entries.len());
         for e in entries {
             if !(0.0..=100.0).contains(&e.score) {
@@ -515,7 +521,7 @@ impl SchoolRationalizationService {
             if e.subject.trim().is_empty() {
                 return Err(AppError::Validation("nama mata pelajaran wajib diisi".to_string()));
             }
-            saved.push(self.alumni.upsert_rapor(alumni_id, e).await?);
+            saved.push(self.alumni.upsert_rapor(alumni_id, e, &actor.tenant).await?);
         }
         Ok(saved)
     }
@@ -523,8 +529,8 @@ impl SchoolRationalizationService {
     pub async fn delete_alumni_rapor(&self, actor: &AuthUser, alumni_id: Uuid, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.ensure_owns_alumni(school_id, alumni_id).await?;
-        let deleted = self.alumni.delete_rapor(alumni_id, id).await?;
+        self.ensure_owns_alumni(school_id, alumni_id, &actor.tenant).await?;
+        let deleted = self.alumni.delete_rapor(alumni_id, id, &actor.tenant).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("nilai rapor alumni {id} tidak ditemukan")));
         }
@@ -536,7 +542,7 @@ impl SchoolRationalizationService {
     pub async fn list_eligibility(&self, actor: &AuthUser) -> AppResult<Vec<SchoolEligibility>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.eligibility.list_by_school(school_id).await
+        self.eligibility.list_by_school(school_id, &actor.tenant).await
     }
 
     /// Sama seperti `list_eligibility`, tapi tiap baris disandingkan dengan jumlah siswa
@@ -549,8 +555,8 @@ impl SchoolRationalizationService {
     pub async fn list_eligibility_with_usage(&self, actor: &AuthUser) -> AppResult<Vec<(SchoolEligibility, i64)>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        let eligibility = self.eligibility.list_by_school(school_id).await?;
-        let participation = self.snbp_participation.list_by_school(school_id).await?;
+        let eligibility = self.eligibility.list_by_school(school_id, &actor.tenant).await?;
+        let participation = self.snbp_participation.list_by_school(school_id, &actor.tenant).await?;
 
         let mut aktif_per_year: HashMap<i32, i64> = HashMap::new();
         for p in &participation {
@@ -574,7 +580,7 @@ impl SchoolRationalizationService {
         if eligible_count < 0 {
             return Err(AppError::Validation("jumlah eligible tidak boleh negatif".to_string()));
         }
-        self.eligibility.upsert(school_id, SchoolEligibilityUpsert { year, eligible_count }).await
+        self.eligibility.upsert(school_id, SchoolEligibilityUpsert { year, eligible_count }, &actor.tenant).await
     }
 
     // ─── SNBT post-exam tracking ("Rekap SNBT") ────────────────────────────────
@@ -588,21 +594,21 @@ impl SchoolRationalizationService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
 
         let mut out = Vec::new();
         for student in &students {
-            let targets = self.ptn_targets.list_by_student(student.id).await?;
+            let targets = self.ptn_targets.list_by_student(student.id, &actor.tenant).await?;
             let snbt_targets: Vec<_> = targets.into_iter().filter(|t| t.track == Track::Snbt).collect();
             if snbt_targets.is_empty() {
                 continue;
             }
-            let sim_run = self.simulation_runs.latest_completed_for_student(student.id).await?;
+            let sim_run = self.simulation_runs.latest_completed_for_student(student.id, &actor.tenant).await?;
             let (est_score, est_score_source) = match sim_run.and_then(|r| r.combined_estimate_score) {
                 Some(score) => (Some(score), Some("simulasi")),
                 None => {
-                    let attempts = self.attempts.list_by_student(student.id).await?;
+                    let attempts = self.attempts.list_by_student(student.id, &actor.tenant).await?;
                     let fallback = average_tryout_score(&attempts).map(|s| (s / PLATFORM_SCALE_MAX) * UTBK_SCALE_MAX);
                     let source = fallback.map(|_| "drilling");
                     (fallback, source)
@@ -634,7 +640,7 @@ impl SchoolRationalizationService {
             let pilihan_2 = iter.next();
 
             // One real exam result per student (not per target) — see `SnbtTracking` doc.
-            let tracking = self.snbt_tracking.get_by_student(student.id).await?;
+            let tracking = self.snbt_tracking.get_by_student(student.id, &actor.tenant).await?;
             out.push(SnbtRosterRow {
                 student_id: student.id,
                 student_name: student.name.clone(),
@@ -672,8 +678,8 @@ impl SchoolRationalizationService {
     pub async fn student_attempt_history(&self, actor: &AuthUser, student_id: Uuid) -> AppResult<Vec<Attempt>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.ensure_owns_student(school_id, student_id).await?;
-        let mut list = self.attempts.list_by_student(student_id).await?;
+        self.ensure_owns_student(school_id, student_id, &actor.tenant).await?;
+        let mut list = self.attempts.list_by_student(student_id, &actor.tenant).await?;
         list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         Ok(list)
     }
@@ -689,9 +695,9 @@ impl SchoolRationalizationService {
     pub async fn student_attempt_result(&self, actor: &AuthUser, student_id: Uuid, attempt_id: Uuid) -> AppResult<AttemptResult> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.ensure_owns_student(school_id, student_id).await?;
-        self.ensure_attempt_belongs_to_student(attempt_id, student_id).await?;
-        self.tryout.result_for_submitted_attempt(attempt_id).await
+        self.ensure_owns_student(school_id, student_id, &actor.tenant).await?;
+        self.ensure_attempt_belongs_to_student(attempt_id, student_id, &actor.tenant).await?;
+        self.tryout.result_for_submitted_attempt(attempt_id, &actor.tenant).await
     }
 
     /// Per-question pembahasan counterpart to `student_attempt_result` — same ownership
@@ -699,15 +705,15 @@ impl SchoolRationalizationService {
     pub async fn student_attempt_review(&self, actor: &AuthUser, student_id: Uuid, attempt_id: Uuid) -> AppResult<Vec<ReviewItem>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.ensure_owns_student(school_id, student_id).await?;
-        self.ensure_attempt_belongs_to_student(attempt_id, student_id).await?;
-        self.tryout.review_for_submitted_attempt(attempt_id).await
+        self.ensure_owns_student(school_id, student_id, &actor.tenant).await?;
+        self.ensure_attempt_belongs_to_student(attempt_id, student_id, &actor.tenant).await?;
+        self.tryout.review_for_submitted_attempt(attempt_id, &actor.tenant).await
     }
 
-    async fn ensure_attempt_belongs_to_student(&self, attempt_id: Uuid, student_id: Uuid) -> AppResult<()> {
+    async fn ensure_attempt_belongs_to_student(&self, attempt_id: Uuid, student_id: Uuid, ctx: &TenantCtx) -> AppResult<()> {
         let attempt = self
             .attempts
-            .find_by_id(attempt_id)
+            .find_by_id(attempt_id, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("attempt {attempt_id} not found")))?;
         if attempt.student_id != student_id {
@@ -726,7 +732,7 @@ impl SchoolRationalizationService {
     ) -> AppResult<SnbtRosterRow> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.ensure_owns_student(school_id, student_id).await?;
+        self.ensure_owns_student(school_id, student_id, &actor.tenant).await?;
         if let Some(score) = input.actual_score {
             if !(0.0..=1000.0).contains(&score) {
                 return Err(AppError::Validation("skor aktual harus di antara 0 dan 1000".to_string()));
@@ -741,6 +747,7 @@ impl SchoolRationalizationService {
                     status: input.status,
                     notes: input.notes,
                 },
+                &actor.tenant,
             )
             .await?;
 
@@ -754,7 +761,7 @@ impl SchoolRationalizationService {
     async fn resolve_own_school_id(&self, actor: &AuthUser) -> AppResult<Uuid> {
         let me = self
             .users
-            .find_by_id(actor.user_id)
+            .find_by_id(actor.user_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Unauthorized("akun tidak ditemukan".to_string()))?;
         me.school_id
@@ -775,7 +782,7 @@ impl SchoolRationalizationService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
         let mut by_nis: HashMap<String, Uuid> = HashMap::new();
         for s in &students {
@@ -812,7 +819,11 @@ impl SchoolRationalizationService {
             }
             match self
                 .rapor
-                .upsert(student_id, RaporScoreUpsert { semester: e.semester, subject: e.subject.clone(), score: e.score, is_minat: e.is_minat })
+                .upsert(
+                    student_id,
+                    RaporScoreUpsert { semester: e.semester, subject: e.subject.clone(), score: e.score, is_minat: e.is_minat },
+                    &actor.tenant,
+                )
                 .await
             {
                 Ok(_) => saved_count += 1,

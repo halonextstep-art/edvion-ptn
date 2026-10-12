@@ -98,7 +98,7 @@ impl PackageService {
     /// rationale.
     pub async fn list_content(&self, actor: &AuthUser, package_id: Uuid) -> AppResult<Vec<PackageContentItem>> {
         self.require_visible(actor, package_id).await?;
-        self.content.list_for_package(package_id).await
+        self.content.list_for_package(package_id, &actor.tenant).await
     }
 
     /// "Setujui Semua Soal" — bulk-approves every question that belongs to a "Set Soal" used
@@ -115,13 +115,13 @@ impl PackageService {
         actor.require_role(&[Role::Admin])?;
         self.require_visible(actor, package_id).await?;
 
-        let items = self.content.list_for_package(package_id).await?;
+        let items = self.content.list_for_package(package_id, &actor.tenant).await?;
         let mut set_ids: Vec<Uuid> = Vec::new();
         for item in items {
             if item.content_type != PackageContentType::TryoutSession {
                 continue;
             }
-            if let Some(session) = self.sessions.find_by_id(item.content_id).await? {
+            if let Some(session) = self.sessions.find_by_id(item.content_id, &actor.tenant).await? {
                 if let Some(set_id) = session.question_set_id {
                     set_ids.push(set_id);
                 }
@@ -150,12 +150,12 @@ impl PackageService {
         // rather than allowed and left to be discovered later via a mismatched report.
         let content_track = match content_type {
             PackageContentType::TryoutSession => {
-                self.sessions.find_by_id(content_id).await?
+                self.sessions.find_by_id(content_id, &actor.tenant).await?
                     .ok_or_else(|| AppError::NotFound(format!("session {content_id} not found")))?
                     .exam_track
             }
             PackageContentType::SimulationTemplate => {
-                self.templates.find_by_id(content_id).await?
+                self.templates.find_by_id(content_id, &actor.tenant).await?
                     .ok_or_else(|| AppError::NotFound(format!("template {content_id} not found")))?
                     .exam_track
             }
@@ -167,12 +167,12 @@ impl PackageService {
                 exam_track_label(content_track),
             )));
         }
-        self.content.add_item(package_id, content_type, content_id).await
+        self.content.add_item(package_id, content_type, content_id, &actor.tenant).await
     }
 
     pub async fn remove_content_item(&self, actor: &AuthUser, item_id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin, Role::Content])?;
-        if !self.content.remove_item(item_id).await? {
+        if !self.content.remove_item(item_id, &actor.tenant).await? {
             return Err(AppError::NotFound(format!("content item {item_id} not found")));
         }
         Ok(())
@@ -189,27 +189,30 @@ impl PackageService {
         }
         let active = if actor.role == Role::Content { false } else { input.active };
         self.packages
-            .create(NewPackage {
-                name: input.name,
-                package_type: input.package_type,
-                original_price: input.original_price,
-                sale_price: input.sale_price,
-                validity: input.validity,
-                features: input.features,
-                badge: input.badge,
-                emoji: input.emoji,
-                icon_type: input.icon_type,
-                icon_name: input.icon_name,
-                icon_url: input.icon_url,
-                banner_url: input.banner_url,
-                gradient: input.gradient,
-                accent_color: input.accent_color,
-                active,
-                sort_order: input.sort_order,
-                created_by: actor.user_id,
-                elective_pick_count: input.elective_pick_count,
-                exam_track: input.exam_track,
-            })
+            .create(
+                NewPackage {
+                    name: input.name,
+                    package_type: input.package_type,
+                    original_price: input.original_price,
+                    sale_price: input.sale_price,
+                    validity: input.validity,
+                    features: input.features,
+                    badge: input.badge,
+                    emoji: input.emoji,
+                    icon_type: input.icon_type,
+                    icon_name: input.icon_name,
+                    icon_url: input.icon_url,
+                    banner_url: input.banner_url,
+                    gradient: input.gradient,
+                    accent_color: input.accent_color,
+                    active,
+                    sort_order: input.sort_order,
+                    created_by: actor.user_id,
+                    elective_pick_count: input.elective_pick_count,
+                    exam_track: input.exam_track,
+                },
+                &actor.tenant,
+            )
             .await
     }
 
@@ -217,7 +220,7 @@ impl PackageService {
     /// awaiting Admin review, plus anything of theirs already published).
     pub async fn list(&self, actor: &AuthUser) -> AppResult<Vec<Package>> {
         actor.require_role(&[Role::Admin, Role::Content])?;
-        let mut all = self.packages.list().await?;
+        let mut all = self.packages.list(&actor.tenant).await?;
         if actor.role == Role::Content {
             all.retain(|p| p.created_by == actor.user_id);
         }
@@ -226,7 +229,7 @@ impl PackageService {
 
     async fn require_visible(&self, actor: &AuthUser, package_id: Uuid) -> AppResult<Package> {
         actor.require_role(&[Role::Admin, Role::Content])?;
-        let pkg = self.packages.find_by_id(package_id).await?
+        let pkg = self.packages.find_by_id(package_id, &actor.tenant).await?
             .ok_or_else(|| AppError::NotFound(format!("package {package_id} not found")))?;
         if actor.role != Role::Admin && pkg.created_by != actor.user_id {
             return Err(AppError::Forbidden("Anda hanya bisa melihat paket yang Anda buat sendiri".to_string()));
@@ -236,7 +239,7 @@ impl PackageService {
 
     async fn require_owned(&self, actor: &AuthUser, package_id: Uuid) -> AppResult<Package> {
         actor.require_role(&[Role::Admin, Role::Content])?;
-        let pkg = self.packages.find_by_id(package_id).await?
+        let pkg = self.packages.find_by_id(package_id, &actor.tenant).await?
             .ok_or_else(|| AppError::NotFound(format!("package {package_id} not found")))?;
         if actor.role != Role::Admin && pkg.created_by != actor.user_id {
             return Err(AppError::Forbidden("Anda hanya bisa mengubah paket yang Anda buat sendiri".to_string()));
@@ -247,9 +250,11 @@ impl PackageService {
     /// No-auth read for the public marketing landing page — only active packages, in the
     /// same display order admins configured, so the page never diverges from what's
     /// actually for sale (previously the landing page had its own separate hardcoded
-    /// catalog that could silently drift from the real one).
+    /// catalog that could silently drift from the real one). Runs as platform-admin `TenantCtx`
+    /// (bypasses RLS) since the public landing page has no tenant/actor of its own and a
+    /// Package is platform-wide catalog content, not scoped to one school.
     pub async fn list_public(&self) -> AppResult<Vec<Package>> {
-        let mut all = self.packages.list().await?;
+        let mut all = self.packages.list(&crate::domain::tenant::TenantCtx::platform_admin()).await?;
         all.retain(|p| p.active);
         all.sort_by_key(|p| p.sort_order);
         Ok(all)
@@ -260,9 +265,10 @@ impl PackageService {
     /// isn't going off the admin's free-text `features` bullets alone. Safe to expose without
     /// auth: content titles are already public-facing marketing information (session/template
     /// titles), nothing sensitive. Returns an empty list (not an error) for an unknown/kosong
-    /// package_id — the landing page should degrade gracefully, not break.
+    /// package_id — the landing page should degrade gracefully, not break. Same platform-admin
+    /// `TenantCtx` rationale as `list_public`.
     pub async fn public_content_titles(&self, package_id: Uuid) -> AppResult<Vec<String>> {
-        let items = self.content.list_for_package(package_id).await?;
+        let items = self.content.list_for_package(package_id, &crate::domain::tenant::TenantCtx::platform_admin()).await?;
         Ok(items
             .into_iter()
             .map(|i| {
@@ -308,6 +314,7 @@ impl PackageService {
                     elective_pick_count: input.elective_pick_count,
                     exam_track: input.exam_track,
                 },
+                &actor.tenant,
             )
             .await?
             .ok_or_else(|| AppError::NotFound(format!("package {id} not found")))
@@ -323,16 +330,16 @@ impl PackageService {
     pub async fn set_active(&self, actor: &AuthUser, id: Uuid, active: bool) -> AppResult<Package> {
         actor.require_role(&[Role::Admin])?;
         let pkg = self.packages
-            .set_active(id, active)
+            .set_active(id, active, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("package {id} not found")))?;
         if active {
-            let items = self.content.list_for_package(id).await.unwrap_or_default();
+            let items = self.content.list_for_package(id, &actor.tenant).await.unwrap_or_default();
             for item in items {
                 let _ = match item.content_type {
-                    PackageContentType::TryoutSession => self.tryout.set_draft(item.content_id, false).await.map(|_| ()),
+                    PackageContentType::TryoutSession => self.tryout.set_draft(item.content_id, false, &actor.tenant).await.map(|_| ()),
                     PackageContentType::SimulationTemplate => {
-                        self.simulation.set_template_draft(item.content_id, false).await.map(|_| ())
+                        self.simulation.set_template_draft(item.content_id, false, &actor.tenant).await.map(|_| ())
                     }
                 };
             }
@@ -347,7 +354,7 @@ impl PackageService {
     pub async fn delete(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin, Role::Content])?;
         if actor.role == Role::Content {
-            let pkg = self.packages.find_by_id(id).await?
+            let pkg = self.packages.find_by_id(id, &actor.tenant).await?
                 .ok_or_else(|| AppError::NotFound(format!("package {id} not found")))?;
             if pkg.created_by != actor.user_id {
                 return Err(AppError::Forbidden("Anda hanya bisa menghapus paket yang Anda buat sendiri".to_string()));
@@ -356,7 +363,7 @@ impl PackageService {
                 return Err(AppError::Forbidden("Paket ini sudah live — hubungi Admin untuk menghapusnya".to_string()));
             }
         }
-        let deleted = self.packages.delete(id).await?;
+        let deleted = self.packages.delete(id, &actor.tenant).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("package {id} not found")));
         }

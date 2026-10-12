@@ -69,24 +69,27 @@ impl QuestionService {
 
         let question = self
             .questions
-            .create(NewQuestion {
-                code,
-                question_type: input.question_type,
-                subject: input.subject,
-                topic: input.topic,
-                subtopic: input.subtopic,
-                difficulty: input.difficulty,
-                bloom_level: input.bloom_level,
-                stimulus: input.stimulus,
-                question_text: input.question_text,
-                options: input.options,
-                correct_answer: input.correct_answer,
-                explanation: input.explanation,
-                tags: input.tags,
-                status,
-                created_by: actor.user_id,
-                time_limit: input.time_limit,
-            })
+            .create(
+                NewQuestion {
+                    code,
+                    question_type: input.question_type,
+                    subject: input.subject,
+                    topic: input.topic,
+                    subtopic: input.subtopic,
+                    difficulty: input.difficulty,
+                    bloom_level: input.bloom_level,
+                    stimulus: input.stimulus,
+                    question_text: input.question_text,
+                    options: input.options,
+                    correct_answer: input.correct_answer,
+                    explanation: input.explanation,
+                    tags: input.tags,
+                    status,
+                    created_by: actor.user_id,
+                    time_limit: input.time_limit,
+                },
+                &actor.tenant,
+            )
             .await?;
 
         // Design choice: surface a set-attach failure as an error instead of silently
@@ -97,29 +100,29 @@ impl QuestionService {
         // problem immediately (the question still exists and can be re-attached via the set
         // management UI; this is not a destructive failure).
         if let Some(set_id) = question_set_id {
-            let next_sort_order = self.question_sets.list_items(set_id).await?.len() as i32;
-            self.question_sets.add_item(set_id, question.id, next_sort_order).await?;
+            let next_sort_order = self.question_sets.list_items(set_id, &actor.tenant).await?.len() as i32;
+            self.question_sets.add_item(set_id, question.id, next_sort_order, &actor.tenant).await?;
         }
 
         Ok(question)
     }
 
-    pub async fn get(&self, id: Uuid) -> AppResult<Question> {
+    pub async fn get(&self, id: Uuid, ctx: &crate::domain::tenant::TenantCtx) -> AppResult<Question> {
         self.questions
-            .find_by_id(id)
+            .find_by_id(id, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("question {id} not found")))
     }
 
-    pub async fn list(&self, filter: QuestionFilter) -> AppResult<(Vec<Question>, i64)> {
-        self.questions.list(filter).await
+    pub async fn list(&self, filter: QuestionFilter, ctx: &crate::domain::tenant::TenantCtx) -> AppResult<(Vec<Question>, i64)> {
+        self.questions.list(filter, ctx).await
     }
 
     pub async fn update(&self, actor: &AuthUser, id: Uuid, input: CreateQuestionInput) -> AppResult<Question> {
         actor.require_role(&[Role::Admin, Role::Content])?;
         validate_answerable(&input)?;
 
-        let existing = self.get(id).await?;
+        let existing = self.get(id, &actor.tenant).await?;
         if actor.role != Role::Admin && !existing.is_owned_by(actor.user_id) {
             return Err(AppError::Forbidden(
                 "you can only edit questions you created".to_string(),
@@ -147,6 +150,7 @@ impl QuestionService {
                     tags: input.tags,
                     time_limit: input.time_limit,
                 },
+                &actor.tenant,
             )
             .await?
             .ok_or_else(|| AppError::NotFound(format!("question {id} not found")))?;
@@ -159,8 +163,8 @@ impl QuestionService {
         // unrelated content edit would be a surprising, destructive side effect. Removing a
         // question from a set is a separate, explicit action via the set management UI.
         if let Some(set_id) = question_set_id {
-            let next_sort_order = self.question_sets.list_items(set_id).await?.len() as i32;
-            self.question_sets.add_item(set_id, updated.id, next_sort_order).await?;
+            let next_sort_order = self.question_sets.list_items(set_id, &actor.tenant).await?.len() as i32;
+            self.question_sets.add_item(set_id, updated.id, next_sort_order, &actor.tenant).await?;
         }
 
         Ok(updated)
@@ -168,13 +172,13 @@ impl QuestionService {
 
     pub async fn delete(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin, Role::Content])?;
-        let existing = self.get(id).await?;
+        let existing = self.get(id, &actor.tenant).await?;
         if actor.role != Role::Admin && !existing.is_owned_by(actor.user_id) {
             return Err(AppError::Forbidden(
                 "you can only delete questions you created".to_string(),
             ));
         }
-        let deleted = self.questions.delete(id).await?;
+        let deleted = self.questions.delete(id, &actor.tenant).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("question {id} not found")));
         }
@@ -203,7 +207,7 @@ impl QuestionService {
         };
 
         self.questions
-            .set_review_status(id, new_status, note, actor.user_id)
+            .set_review_status(id, new_status, note, actor.user_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("question {id} not found")))
     }
@@ -215,7 +219,7 @@ impl QuestionService {
     pub async fn submit_for_review(&self, actor: &AuthUser, id: Uuid) -> AppResult<Question> {
         actor.require_role(&[Role::Admin, Role::Content])?;
 
-        let existing = self.get(id).await?;
+        let existing = self.get(id, &actor.tenant).await?;
         if actor.role != Role::Admin && !existing.is_owned_by(actor.user_id) {
             return Err(AppError::Forbidden(
                 "you can only submit questions you created".to_string(),
@@ -231,7 +235,7 @@ impl QuestionService {
         }
 
         self.questions
-            .resubmit(id)
+            .resubmit(id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("question {id} not found")))
     }
@@ -253,7 +257,7 @@ impl QuestionService {
         let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
         let mut approved_count = 0usize;
         for set_id in set_ids {
-            for question in self.question_sets.list_items(*set_id).await? {
+            for question in self.question_sets.list_items(*set_id, &actor.tenant).await? {
                 if !seen.insert(question.id) {
                     continue; // same question reused across multiple sets in this call
                 }
@@ -261,7 +265,7 @@ impl QuestionService {
                     continue;
                 }
                 self.questions
-                    .set_review_status(question.id, QuestionStatus::Approved, None, actor.user_id)
+                    .set_review_status(question.id, QuestionStatus::Approved, None, actor.user_id, &actor.tenant)
                     .await?;
                 approved_count += 1;
             }

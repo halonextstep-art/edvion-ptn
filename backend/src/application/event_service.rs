@@ -54,27 +54,30 @@ impl EventService {
     pub async fn create(&self, actor: &AuthUser, input: CreateEventInput) -> AppResult<Event> {
         actor.require_role(&[Role::Admin])?;
         validate_name(&input.name)?;
-        self.ensure_session_exists(input.session_id).await?;
+        self.ensure_session_exists(input.session_id, &actor.tenant).await?;
         self.events
-            .create(NewEvent {
-                name: input.name,
-                event_type: input.event_type,
-                description: input.description,
-                session_id: input.session_id,
-                start_date: input.start_date,
-                end_date: input.end_date,
-                max_participants: input.max_participants,
-                price: input.price,
-                prizes: input.prizes,
-                target_class: input.target_class,
-                created_by: actor.user_id,
-            })
+            .create(
+                NewEvent {
+                    name: input.name,
+                    event_type: input.event_type,
+                    description: input.description,
+                    session_id: input.session_id,
+                    start_date: input.start_date,
+                    end_date: input.end_date,
+                    max_participants: input.max_participants,
+                    price: input.price,
+                    prizes: input.prizes,
+                    target_class: input.target_class,
+                    created_by: actor.user_id,
+                },
+                &actor.tenant,
+            )
             .await
     }
 
     pub async fn list(&self, actor: &AuthUser) -> AppResult<Vec<Event>> {
         actor.require_role(&[Role::Admin])?;
-        self.events.list().await
+        self.events.list(&actor.tenant).await
     }
 
     /// Student/school-portal "Event Mendatang" widget — any authenticated role can see
@@ -82,7 +85,7 @@ impl EventService {
     /// since the event catalog is small; no separate scoped SQL query needed.
     pub async fn list_upcoming(&self, actor: &AuthUser, limit: i64) -> AppResult<Vec<Event>> {
         actor.require_role(&[Role::Admin, Role::Student, Role::School])?;
-        let mut events = self.events.list().await?;
+        let mut events = self.events.list(&actor.tenant).await?;
         events.retain(|e| matches!(e.status, EventStatus::Upcoming | EventStatus::Ongoing));
         events.sort_by_key(|e| e.start_date);
         events.truncate(limit.clamp(1, 50) as usize);
@@ -92,7 +95,7 @@ impl EventService {
     pub async fn get(&self, actor: &AuthUser, id: Uuid) -> AppResult<Event> {
         actor.require_role(&[Role::Admin])?;
         self.events
-            .find_by_id(id)
+            .find_by_id(id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("event {id} not found")))
     }
@@ -100,7 +103,7 @@ impl EventService {
     pub async fn update(&self, actor: &AuthUser, id: Uuid, input: UpdateEventInput) -> AppResult<Event> {
         actor.require_role(&[Role::Admin])?;
         validate_name(&input.name)?;
-        self.ensure_session_exists(input.session_id).await?;
+        self.ensure_session_exists(input.session_id, &actor.tenant).await?;
         self.events
             .update(
                 id,
@@ -117,6 +120,7 @@ impl EventService {
                     prizes: input.prizes,
                     target_class: input.target_class,
                 },
+                &actor.tenant,
             )
             .await?
             .ok_or_else(|| AppError::NotFound(format!("event {id} not found")))
@@ -125,23 +129,23 @@ impl EventService {
     pub async fn set_status(&self, actor: &AuthUser, id: Uuid, status: EventStatus) -> AppResult<Event> {
         actor.require_role(&[Role::Admin])?;
         self.events
-            .set_status(id, status)
+            .set_status(id, status, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("event {id} not found")))
     }
 
     pub async fn delete(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin])?;
-        let deleted = self.events.delete(id).await?;
+        let deleted = self.events.delete(id, &actor.tenant).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("event {id} not found")));
         }
         Ok(())
     }
 
-    async fn ensure_session_exists(&self, session_id: Uuid) -> AppResult<()> {
+    async fn ensure_session_exists(&self, session_id: Uuid, ctx: &crate::domain::tenant::TenantCtx) -> AppResult<()> {
         self.sessions
-            .find_by_id(session_id)
+            .find_by_id(session_id, ctx)
             .await?
             .ok_or_else(|| AppError::Validation("paket soal (session) yang dipilih tidak ditemukan".to_string()))?;
         Ok(())

@@ -73,7 +73,10 @@ pub async fn login(
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
-    let result = state.auth_service.login(&payload.email, &payload.password).await?;
+    let result = state
+        .auth_service
+        .login(&payload.username, payload.tenant_slug.as_deref(), &payload.password)
+        .await?;
 
     Ok(Json(AuthResponse {
         token: result.token,
@@ -82,7 +85,7 @@ pub async fn login(
 }
 
 pub async fn me(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<UserResponse>> {
-    let user = state.auth_service.me(auth.user_id).await?;
+    let user = state.auth_service.me(auth.user_id, &auth.tenant).await?;
     Ok(Json(user.into()))
 }
 
@@ -103,6 +106,7 @@ pub async fn update_profile(
         .update_profile(
             auth.user_id,
             UpdateProfileInput { name: payload.name, phone: payload.phone, minat_jurusan: payload.minat_jurusan },
+            &auth.tenant,
         )
         .await?;
 
@@ -123,7 +127,7 @@ pub async fn upload_avatar(
         .map_err(|e| AppError::Validation(format!("gagal membaca upload: {e}")))?
         .ok_or_else(|| AppError::Validation("tidak ada file yang diunggah".to_string()))?;
     let url = save_upload(field, &AVATAR_POLICY).await?;
-    let user = state.auth_service.set_avatar(auth.user_id, Some(url)).await?;
+    let user = state.auth_service.set_avatar(auth.user_id, Some(url), &auth.tenant).await?;
     Ok(Json(user.into()))
 }
 
@@ -142,6 +146,7 @@ pub async fn change_password(
         .change_password(
             auth.user_id,
             ChangePasswordInput { current_password: payload.current_password, new_password: payload.new_password },
+            &auth.tenant,
         )
         .await?;
 

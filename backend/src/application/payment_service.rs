@@ -39,6 +39,7 @@ use crate::domain::repository::{
     NewPaymentTransaction, PackageRepository, PaymentStatusUpdate, PaymentTransactionRepository, UserFilter,
     UserRepository,
 };
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::domain::voucher::Voucher;
 use crate::error::{AppError, AppResult};
@@ -89,7 +90,8 @@ impl PaymentService {
     /// logged and swallowed (same tolerance as the single-recipient `notify()` calls elsewhere
     /// in this service).
     async fn notify_all_admins(&self, kind: &str, title: &str, message: &str, link_tab: Option<&str>) {
-        let admins = match self.users.list(UserFilter { role: Some(Role::Admin), ..Default::default() }).await {
+        let ctx = crate::domain::tenant::TenantCtx::platform_admin();
+        let admins = match self.users.list(UserFilter { role: Some(Role::Admin), ..Default::default() }, &ctx).await {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "gagal memuat daftar admin untuk notifikasi");
@@ -114,9 +116,9 @@ impl PaymentService {
         self.provider.name()
     }
 
-    async fn find_package(&self, package_id: Uuid) -> AppResult<Package> {
+    async fn find_package(&self, package_id: Uuid, ctx: &TenantCtx) -> AppResult<Package> {
         self.packages
-            .find_by_id(package_id)
+            .find_by_id(package_id, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound("paket tidak ditemukan".to_string()))
     }
@@ -127,19 +129,22 @@ impl PaymentService {
     /// only the checkout-session step depends on a real provider being wired in.
     pub async fn initiate_purchase(&self, actor: &AuthUser, package_id: Uuid) -> AppResult<(PaymentTransaction, PurchaseOutcome)> {
         actor.require_role(&[Role::Student, Role::School])?;
-        let package = self.find_package(package_id).await?;
+        let package = self.find_package(package_id, &actor.tenant).await?;
         if !package.active {
             return Err(AppError::Validation("paket ini sedang tidak tersedia untuk dibeli".to_string()));
         }
 
         let transaction = self
             .transactions
-            .create(NewPaymentTransaction {
-                package_id: package.id,
-                buyer_user_id: actor.user_id,
-                amount: package.sale_price,
-                currency: "IDR".to_string(),
-            })
+            .create(
+                NewPaymentTransaction {
+                    package_id: package.id,
+                    buyer_user_id: actor.user_id,
+                    amount: package.sale_price,
+                    currency: "IDR".to_string(),
+                },
+                &actor.tenant,
+            )
             .await?;
 
         // Honest behavior: with `NotConfiguredProvider` this returns
@@ -171,7 +176,7 @@ impl PaymentService {
     /// on eventually falls out of the active queue instead of sitting there forever.
     pub async fn list_pending(&self, actor: &AuthUser) -> AppResult<Vec<PaymentTransaction>> {
         actor.require_role(&[Role::Admin])?;
-        let pending = self.transactions.list_by_status(PaymentStatus::Pending).await?;
+        let pending = self.transactions.list_by_status(PaymentStatus::Pending, &actor.tenant).await?;
         let cutoff = Utc::now() - chrono::Duration::days(PENDING_EXPIRY_DAYS);
         let mut still_pending = Vec::with_capacity(pending.len());
         for tx in pending {
@@ -188,6 +193,7 @@ impl PaymentService {
                                 "Otomatis kedaluwarsa — tidak ada konfirmasi admin dalam {PENDING_EXPIRY_DAYS} hari"
                             )),
                         },
+                        &actor.tenant,
                     )
                     .await;
                 // Not pushed to still_pending — it just left the active queue.
@@ -205,7 +211,7 @@ impl PaymentService {
     pub async fn cancel_transaction(&self, actor: &AuthUser, transaction_id: Uuid) -> AppResult<PaymentTransaction> {
         let tx = self
             .transactions
-            .find_by_id(transaction_id)
+            .find_by_id(transaction_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound("transaksi tidak ditemukan".to_string()))?;
         if tx.buyer_user_id != actor.user_id {
@@ -223,6 +229,7 @@ impl PaymentService {
                     provider_ref: tx.provider_ref.clone(),
                     failure_reason: None,
                 },
+                &actor.tenant,
             )
             .await
     }
@@ -235,7 +242,7 @@ impl PaymentService {
         actor.require_role(&[Role::Admin])?;
         let transaction = self
             .transactions
-            .find_by_id(transaction_id)
+            .find_by_id(transaction_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound("transaksi tidak ditemukan".to_string()))?;
         if transaction.status != PaymentStatus::Pending {
@@ -262,6 +269,7 @@ impl PaymentService {
                     provider_ref: Some(voucher.code.clone()),
                     failure_reason: None,
                 },
+                &actor.tenant,
             )
             .await?;
 
@@ -271,7 +279,7 @@ impl PaymentService {
         // (the buyer already has real access via the voucher above), so this is logged and
         // swallowed rather than propagated.
         let package_name = self
-            .find_package(transaction.package_id)
+            .find_package(transaction.package_id, &actor.tenant)
             .await
             .map(|p| p.name)
             .unwrap_or_else(|_| "paket".to_string());
@@ -293,13 +301,13 @@ impl PaymentService {
     }
 
     pub async fn list_my_transactions(&self, actor: &AuthUser) -> AppResult<Vec<PaymentTransaction>> {
-        self.transactions.list_by_buyer(actor.user_id).await
+        self.transactions.list_by_buyer(actor.user_id, &actor.tenant).await
     }
 
     pub async fn get_transaction(&self, actor: &AuthUser, id: Uuid) -> AppResult<PaymentTransaction> {
         let tx = self
             .transactions
-            .find_by_id(id)
+            .find_by_id(id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound("transaksi tidak ditemukan".to_string()))?;
         if tx.buyer_user_id != actor.user_id {
@@ -315,10 +323,11 @@ impl PaymentService {
     /// callers should treat a `NotImplemented` response as "acknowledged, nothing to do"
     /// rather than something to retry indefinitely.
     pub async fn handle_webhook(&self, raw_body: &[u8], signature_header: Option<&str>) -> AppResult<PaymentTransaction> {
+        let ctx = TenantCtx::platform_admin();
         let outcome: WebhookOutcome = self.provider.verify_webhook(raw_body, signature_header).await?;
         let tx = self
             .transactions
-            .find_by_provider_ref(&outcome.provider_ref)
+            .find_by_provider_ref(&outcome.provider_ref, &ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("transaksi dengan provider_ref {} tidak ditemukan", outcome.provider_ref)))?;
         self.transactions
@@ -330,6 +339,7 @@ impl PaymentService {
                     provider_ref: Some(outcome.provider_ref),
                     failure_reason: outcome.failure_reason,
                 },
+                &ctx,
             )
             .await
     }

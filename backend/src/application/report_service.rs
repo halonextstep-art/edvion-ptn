@@ -29,6 +29,7 @@ use crate::domain::report::{
     ParticipationPayload, ParticipationRow, PerformancePayload, PtnTargetPayload, RankingRow, Report, ReportPayload,
     ReportType, TkaPackageSummaryRow, TkaReportPayload, TkaStudentReportRow, UniversityCountSnapshot,
 };
+use crate::domain::tenant::TenantCtx;
 use crate::domain::tryout::{Attempt, AttemptStatus};
 use crate::domain::user::{Role, User};
 use crate::error::{AppError, AppResult};
@@ -81,17 +82,17 @@ impl ReportService {
     async fn resolve_own_school_id(&self, actor: &AuthUser) -> AppResult<Uuid> {
         let me = self
             .users
-            .find_by_id(actor.user_id)
+            .find_by_id(actor.user_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Unauthorized("akun tidak ditemukan".to_string()))?;
         me.school_id
             .ok_or_else(|| AppError::Validation("akun sekolah ini belum terhubung ke data sekolah".to_string()))
     }
 
-    async fn roster_for(&self, school_id: Uuid, class_filter: Option<&str>) -> AppResult<Vec<User>> {
+    async fn roster_for(&self, school_id: Uuid, class_filter: Option<&str>, ctx: &TenantCtx) -> AppResult<Vec<User>> {
         let all = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, ctx)
             .await?;
         Ok(match class_filter {
             Some(g) => all.into_iter().filter(|u| u.grade.as_deref() == Some(g)).collect(),
@@ -109,13 +110,13 @@ impl ReportService {
         let (payload, type_label) = match input.report_type {
             ReportType::Performance => {
                 let p = self
-                    .build_performance(school_id, input.class_filter.as_deref(), input.year_month.as_deref(), input.exam_track_filter)
+                    .build_performance(school_id, input.class_filter.as_deref(), input.year_month.as_deref(), input.exam_track_filter, &actor.tenant)
                     .await?;
                 (ReportPayload::Performance(p), "Performa Siswa")
             }
             ReportType::Participation => {
                 let p = self
-                    .build_participation(school_id, input.class_filter.as_deref(), input.year_month.as_deref(), input.exam_track_filter)
+                    .build_participation(school_id, input.class_filter.as_deref(), input.year_month.as_deref(), input.exam_track_filter, &actor.tenant)
                     .await?;
                 (ReportPayload::Participation(p), "Partisipasi Tryout")
             }
@@ -150,29 +151,35 @@ impl ReportService {
         };
 
         self.reports
-            .create(NewReport {
-                school_id,
-                report_type: input.report_type,
-                title,
-                period_label: input.period_label,
-                class_filter,
-                exam_track_filter,
-                payload,
-            })
+            .create(
+                NewReport {
+                    school_id,
+                    report_type: input.report_type,
+                    title,
+                    period_label: input.period_label,
+                    class_filter,
+                    exam_track_filter,
+                    payload,
+                },
+                &actor.tenant,
+            )
             .await
     }
 
     pub async fn list(&self, actor: &AuthUser) -> AppResult<Vec<Report>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.reports.list_by_school(school_id).await
+        self.reports.list_by_school(school_id, &actor.tenant).await
     }
 
     pub async fn get(&self, actor: &AuthUser, id: Uuid) -> AppResult<Report> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        let report =
-            self.reports.find_by_id(id).await?.ok_or_else(|| AppError::NotFound("laporan tidak ditemukan".to_string()))?;
+        let report = self
+            .reports
+            .find_by_id(id, &actor.tenant)
+            .await?
+            .ok_or_else(|| AppError::NotFound("laporan tidak ditemukan".to_string()))?;
         if report.school_id != school_id {
             return Err(AppError::Forbidden("laporan ini bukan milik sekolah anda".to_string()));
         }
@@ -181,7 +188,7 @@ impl ReportService {
 
     pub async fn delete(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         let report = self.get(actor, id).await?; // ownership check reused
-        self.reports.delete(report.id).await
+        self.reports.delete(report.id, &actor.tenant).await
     }
 
     // ── Performance ──────────────────────────────────────────────────────────────
@@ -191,8 +198,8 @@ impl ReportService {
     /// track each `Attempt` belongs to. `Attempt` itself doesn't denormalize `exam_track` (it
     /// only carries `session_title`/`session_type`), so this cross-reference is the cheapest
     /// way to filter without touching that widely-used struct.
-    async fn session_exam_tracks(&self) -> AppResult<HashMap<Uuid, ExamTrack>> {
-        let sessions = self.sessions.list(None).await?;
+    async fn session_exam_tracks(&self, ctx: &TenantCtx) -> AppResult<HashMap<Uuid, ExamTrack>> {
+        let sessions = self.sessions.list(None, ctx).await?;
         Ok(sessions.into_iter().map(|s| (s.id, s.exam_track)).collect())
     }
 
@@ -209,9 +216,10 @@ impl ReportService {
         class_filter: Option<&str>,
         year_month: Option<&str>,
         exam_track_filter: Option<ExamTrack>,
+        ctx: &TenantCtx,
     ) -> AppResult<PerformancePayload> {
-        let students = self.roster_for(school_id, class_filter).await?;
-        let tracks = self.session_exam_tracks().await?;
+        let students = self.roster_for(school_id, class_filter, ctx).await?;
+        let tracks = self.session_exam_tracks(ctx).await?;
 
         let mut per_class: HashMap<String, (i64, f64, i64)> = HashMap::new(); // grade -> (student_count, score_sum, score_n)
         let mut monthly: HashMap<String, (f64, i64)> = HashMap::new(); // "YYYY-MM" -> (score_sum, attempt_count)
@@ -220,7 +228,7 @@ impl ReportService {
         let mut total_n = 0i64;
 
         for s in &students {
-            let attempts = self.attempts.list_by_student(s.id).await?;
+            let attempts = self.attempts.list_by_student(s.id, ctx).await?;
 
             let in_period: Vec<&Attempt> = attempts
                 .iter()
@@ -314,15 +322,16 @@ impl ReportService {
         class_filter: Option<&str>,
         year_month: Option<&str>,
         exam_track_filter: Option<ExamTrack>,
+        ctx: &TenantCtx,
     ) -> AppResult<ParticipationPayload> {
-        let students = self.roster_for(school_id, class_filter).await?;
-        let tracks = self.session_exam_tracks().await?;
+        let students = self.roster_for(school_id, class_filter, ctx).await?;
+        let tracks = self.session_exam_tracks(ctx).await?;
         let mut rows = Vec::with_capacity(students.len());
         let mut total_attempts = 0i64;
         let mut active = 0i64;
 
         for s in &students {
-            let attempts = self.attempts.list_by_student(s.id).await?;
+            let attempts = self.attempts.list_by_student(s.id, ctx).await?;
             let in_period: Vec<&Attempt> = attempts
                 .iter()
                 .filter(|a| a.status == AttemptStatus::Submitted)
@@ -381,7 +390,7 @@ impl ReportService {
         // `TkaStudentRow` doesn't carry grade (school_tka_service has no class-filter concept
         // of its own) — cross-reference against the roster so this report can be scoped by
         // class like every other report type.
-        let roster = self.roster_for(school_id, None).await?;
+        let roster = self.roster_for(school_id, None, &actor.tenant).await?;
         let grade_by_student: HashMap<Uuid, Option<String>> = roster.into_iter().map(|u| (u.id, u.grade)).collect();
 
         let mut package_rows = Vec::with_capacity(groups.len());
@@ -498,7 +507,7 @@ impl ReportService {
         const DEFAULT_THRESHOLD: i32 = 75;
         let threshold_used = threshold.filter(|t| (0..=100).contains(t)).unwrap_or(DEFAULT_THRESHOLD);
 
-        let students = self.roster_for(school_id, class_filter).await?;
+        let students = self.roster_for(school_id, class_filter, &actor.tenant).await?;
 
         // Union of students with a real, measurable PTN target (SNBP and/or SNBT) — the
         // "kesiapan lulusan" indicator. Both calls are whole-school (no class filter of their
@@ -519,7 +528,7 @@ impl ReportService {
         let mut with_target_total = 0i64;
 
         for s in &students {
-            let attempts = self.attempts.list_by_student(s.id).await?;
+            let attempts = self.attempts.list_by_student(s.id, &actor.tenant).await?;
             let submitted: Vec<&Attempt> = attempts.iter().filter(|a| a.status == AttemptStatus::Submitted && a.score.is_some()).collect();
             let scores: Vec<i32> = submitted.iter().filter_map(|a| a.score).collect();
             let avg = avg_i32(&scores);

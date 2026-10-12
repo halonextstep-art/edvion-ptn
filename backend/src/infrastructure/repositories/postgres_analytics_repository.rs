@@ -1,10 +1,11 @@
 //! Read-only aggregation queries backing the Admin Analytics screen. Every number here
-//! comes straight from `attempts`/`attempt_answers`/`questions`/`users`/`schools` — no
-//! seeded/mocked figures, so the dashboard only ever shows what's actually happened.
+//! comes straight from `ptn.attempts`/`ptn.attempt_answers`/`ptn.questions`/`core.akun`/
+//! `core.tenant` — no seeded/mocked figures, so the dashboard only ever shows what's
+//! actually happened.
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::domain::analytics::{
@@ -12,6 +13,7 @@ use crate::domain::analytics::{
     SubjectAccuracy, YearlyPerformancePoint,
 };
 use crate::domain::repository::AnalyticsRepository;
+use crate::domain::tenant::TenantCtx;
 use crate::error::AppResult;
 
 pub struct PostgresAnalyticsRepository {
@@ -21,6 +23,16 @@ pub struct PostgresAnalyticsRepository {
 impl PostgresAnalyticsRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    async fn begin_tx(&self, ctx: &TenantCtx) -> AppResult<Transaction<'static, Postgres>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true), set_config('app.is_platform_admin', $2, true)")
+            .bind(ctx.tenant_id.to_string())
+            .bind(if ctx.is_platform_admin { "true" } else { "false" })
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
     }
 }
 
@@ -82,34 +94,38 @@ struct StudentActivityRow {
 
 #[async_trait]
 impl AnalyticsRepository for PostgresAnalyticsRepository {
-    async fn summary(&self) -> AppResult<AnalyticsSummary> {
-        let total_students: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'student'")
-            .fetch_one(&self.pool)
+    async fn summary(&self, ctx: &TenantCtx) -> AppResult<AnalyticsSummary> {
+        let mut tx = self.begin_tx(ctx).await?;
+        let total_students: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM core.akun a JOIN core.role r ON r.id = a.role_id WHERE r.kode = 'SISWA'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let total_schools: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ptn.school_profile")
+            .fetch_one(&mut *tx)
             .await?;
-        let total_schools: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schools")
-            .fetch_one(&self.pool)
-            .await?;
-        let total_questions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM questions")
-            .fetch_one(&self.pool)
+        let total_questions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ptn.questions")
+            .fetch_one(&mut *tx)
             .await?;
         let approved_questions: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM questions WHERE status = 'approved'")
-                .fetch_one(&self.pool)
+            sqlx::query_scalar("SELECT COUNT(*) FROM ptn.questions WHERE status = 'approved'")
+                .fetch_one(&mut *tx)
                 .await?;
-        let total_attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attempts")
-            .fetch_one(&self.pool)
+        let total_attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ptn.attempts")
+            .fetch_one(&mut *tx)
             .await?;
         let submitted_attempts: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM attempts WHERE status = 'submitted'")
-                .fetch_one(&self.pool)
+            sqlx::query_scalar("SELECT COUNT(*) FROM ptn.attempts WHERE status = 'submitted'")
+                .fetch_one(&mut *tx)
                 .await?;
         // AVG() on an integer column returns `numeric` in Postgres, which sqlx can't
         // decode straight into `f64` — cast to `float8` (double precision) explicitly.
         let average_score: f64 = sqlx::query_scalar(
-            "SELECT COALESCE(AVG(score), 0)::float8 FROM attempts WHERE status = 'submitted'",
+            "SELECT COALESCE(AVG(score), 0)::float8 FROM ptn.attempts WHERE status = 'submitted'",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(AnalyticsSummary {
             total_students,
@@ -122,19 +138,21 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
         })
     }
 
-    async fn score_trend(&self, days: i32) -> AppResult<Vec<ScoreTrendPoint>> {
+    async fn score_trend(&self, days: i32, ctx: &TenantCtx) -> AppResult<Vec<ScoreTrendPoint>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, ScoreTrendRow>(
             r#"SELECT date_trunc('day', submitted_at)::date AS day,
                       COUNT(*) AS attempts,
                       COALESCE(AVG(score), 0)::float8 AS average_score
-               FROM attempts
+               FROM ptn.attempts
                WHERE status = 'submitted' AND submitted_at >= now() - make_interval(days => $1)
                GROUP BY day
                ORDER BY day ASC"#,
         )
         .bind(days)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -142,19 +160,21 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn subject_breakdown(&self) -> AppResult<Vec<SubjectAccuracy>> {
+    async fn subject_breakdown(&self, ctx: &TenantCtx) -> AppResult<Vec<SubjectAccuracy>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, SubjectRow>(
             r#"SELECT q.subject AS subject,
                       COUNT(*) FILTER (WHERE aa.is_correct = true) AS correct,
                       COUNT(*) AS total
-               FROM attempt_answers aa
-               JOIN questions q ON q.id = aa.question_id
+               FROM ptn.attempt_answers aa
+               JOIN ptn.questions q ON q.id = aa.question_id
                WHERE aa.is_correct IS NOT NULL
                GROUP BY q.subject
                ORDER BY total DESC"#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -162,33 +182,38 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn question_status_distribution(&self) -> AppResult<Vec<QuestionStatusCount>> {
+    async fn question_status_distribution(&self, ctx: &TenantCtx) -> AppResult<Vec<QuestionStatusCount>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, StatusRow>(
-            "SELECT status, COUNT(*) AS count FROM questions GROUP BY status ORDER BY count DESC",
+            "SELECT status, COUNT(*) AS count FROM ptn.questions GROUP BY status ORDER BY count DESC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows.into_iter().map(|r| QuestionStatusCount { status: r.status, count: r.count }).collect())
     }
 
-    async fn top_schools(&self, limit: i64) -> AppResult<Vec<SchoolRanking>> {
+    async fn top_schools(&self, limit: i64, ctx: &TenantCtx) -> AppResult<Vec<SchoolRanking>> {
+        let mut tx = self.begin_tx(ctx).await?;
         // INNER JOINs are intentional here — a school with zero submitted attempts has
         // nothing to rank, so it's correctly left out rather than shown with a fake 0.
         let rows = sqlx::query_as::<_, SchoolRankingRow>(
-            r#"SELECT s.id AS school_id, s.name AS school_name,
+            r#"SELECT t.public_id AS school_id, t.name AS school_name,
                       COUNT(DISTINCT a.student_id) AS active_students,
                       COALESCE(AVG(a.score), 0)::float8 AS average_score
-               FROM schools s
-               JOIN users u ON u.school_id = s.id AND u.role = 'student'
-               JOIN attempts a ON a.student_id = u.id AND a.status = 'submitted'
-               GROUP BY s.id, s.name
+               FROM core.tenant t
+               JOIN core.akun u ON u.tenant_id = t.id
+               JOIN core.role r ON r.id = u.role_id AND r.kode = 'SISWA'
+               JOIN ptn.attempts a ON a.student_id = u.id AND a.status = 'submitted'
+               GROUP BY t.id, t.public_id, t.name
                ORDER BY average_score DESC
                LIMIT $1"#,
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -201,19 +226,21 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn score_trend_by_year(&self) -> AppResult<Vec<YearlyPerformancePoint>> {
+    async fn score_trend_by_year(&self, ctx: &TenantCtx) -> AppResult<Vec<YearlyPerformancePoint>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, YearlyPerformanceRow>(
             r#"SELECT EXTRACT(YEAR FROM submitted_at)::int AS year,
                       COUNT(*) AS attempts,
                       COUNT(DISTINCT student_id) AS distinct_students,
                       COALESCE(AVG(score), 0)::float8 AS average_score
-               FROM attempts
+               FROM ptn.attempts
                WHERE status = 'submitted'
                GROUP BY year
                ORDER BY year ASC"#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -226,22 +253,25 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn subject_breakdown_for_school(&self, school_id: Uuid) -> AppResult<Vec<SubjectAccuracy>> {
+    async fn subject_breakdown_for_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<SubjectAccuracy>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, SubjectRow>(
             r#"SELECT q.subject AS subject,
                       COUNT(*) FILTER (WHERE aa.is_correct = true) AS correct,
                       COUNT(*) AS total
-               FROM attempt_answers aa
-               JOIN questions q ON q.id = aa.question_id
-               JOIN attempts a ON a.id = aa.attempt_id
-               JOIN users u ON u.id = a.student_id
-               WHERE aa.is_correct IS NOT NULL AND u.school_id = $1
+               FROM ptn.attempt_answers aa
+               JOIN ptn.questions q ON q.id = aa.question_id
+               JOIN ptn.attempts a ON a.id = aa.attempt_id
+               JOIN core.akun u ON u.id = a.student_id
+               JOIN core.tenant t ON t.id = u.tenant_id
+               WHERE aa.is_correct IS NOT NULL AND t.public_id = $1
                GROUP BY q.subject
                ORDER BY total DESC"#,
         )
         .bind(school_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -249,22 +279,25 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn score_trend_for_school(&self, school_id: Uuid, days: i32) -> AppResult<Vec<ScoreTrendPoint>> {
+    async fn score_trend_for_school(&self, school_id: Uuid, days: i32, ctx: &TenantCtx) -> AppResult<Vec<ScoreTrendPoint>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, ScoreTrendRow>(
             r#"SELECT date_trunc('day', a.submitted_at)::date AS day,
                       COUNT(*) AS attempts,
                       COALESCE(AVG(a.score), 0)::float8 AS average_score
-               FROM attempts a
-               JOIN users u ON u.id = a.student_id
-               WHERE a.status = 'submitted' AND u.school_id = $1
+               FROM ptn.attempts a
+               JOIN core.akun u ON u.id = a.student_id
+               JOIN core.tenant t ON t.id = u.tenant_id
+               WHERE a.status = 'submitted' AND t.public_id = $1
                  AND a.submitted_at >= now() - make_interval(days => $2)
                GROUP BY day
                ORDER BY day ASC"#,
         )
         .bind(school_id)
         .bind(days)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -272,21 +305,24 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn score_trend_by_year_for_school(&self, school_id: Uuid) -> AppResult<Vec<YearlyPerformancePoint>> {
+    async fn score_trend_by_year_for_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<YearlyPerformancePoint>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, YearlyPerformanceRow>(
             r#"SELECT EXTRACT(YEAR FROM a.submitted_at)::int AS year,
                       COUNT(*) AS attempts,
                       COUNT(DISTINCT a.student_id) AS distinct_students,
                       COALESCE(AVG(a.score), 0)::float8 AS average_score
-               FROM attempts a
-               JOIN users u ON u.id = a.student_id
-               WHERE a.status = 'submitted' AND u.school_id = $1
+               FROM ptn.attempts a
+               JOIN core.akun u ON u.id = a.student_id
+               JOIN core.tenant t ON t.id = u.tenant_id
+               WHERE a.status = 'submitted' AND t.public_id = $1
                GROUP BY year
                ORDER BY year ASC"#,
         )
         .bind(school_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -299,21 +335,24 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn subject_breakdown_for_student(&self, student_id: Uuid) -> AppResult<Vec<SubjectAccuracy>> {
+    async fn subject_breakdown_for_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<SubjectAccuracy>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, SubjectRow>(
             r#"SELECT q.subject AS subject,
                       COUNT(*) FILTER (WHERE aa.is_correct = true) AS correct,
                       COUNT(*) AS total
-               FROM attempt_answers aa
-               JOIN questions q ON q.id = aa.question_id
-               JOIN attempts a ON a.id = aa.attempt_id
-               WHERE aa.is_correct IS NOT NULL AND a.student_id = $1
+               FROM ptn.attempt_answers aa
+               JOIN ptn.questions q ON q.id = aa.question_id
+               JOIN ptn.attempts a ON a.id = aa.attempt_id
+               JOIN core.akun u ON u.id = a.student_id
+               WHERE aa.is_correct IS NOT NULL AND u.public_id = $1
                GROUP BY q.subject
                ORDER BY total DESC"#,
         )
         .bind(student_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -321,21 +360,25 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn student_ranking_for_school(&self, school_id: Uuid) -> AppResult<Vec<StudentRanking>> {
+    async fn student_ranking_for_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<StudentRanking>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, StudentRankingRow>(
-            r#"SELECT u.id AS student_id, u.name AS student_name,
+            r#"SELECT u.public_id AS student_id, u.full_name AS student_name,
                       COUNT(a.id) AS attempts_count,
                       MAX(a.score) AS best_score,
                       COALESCE(AVG(a.score), 0)::float8 AS average_score
-               FROM users u
-               JOIN attempts a ON a.student_id = u.id AND a.status = 'submitted'
-               WHERE u.role = 'student' AND u.school_id = $1
-               GROUP BY u.id, u.name
+               FROM core.akun u
+               JOIN core.role r ON r.id = u.role_id AND r.kode = 'SISWA'
+               JOIN core.tenant t ON t.id = u.tenant_id
+               JOIN ptn.attempts a ON a.student_id = u.id AND a.status = 'submitted'
+               WHERE t.public_id = $1
+               GROUP BY u.id, u.public_id, u.full_name
                ORDER BY average_score DESC"#,
         )
         .bind(school_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -349,26 +392,30 @@ impl AnalyticsRepository for PostgresAnalyticsRepository {
             .collect())
     }
 
-    async fn student_activity_for_school(&self, school_id: Uuid) -> AppResult<Vec<StudentActivity>> {
+    async fn student_activity_for_school(&self, school_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<StudentActivity>> {
         // LEFT JOIN (not INNER, unlike student_ranking_for_school above) — a student with zero
         // submitted attempts must still appear as a row with attempts_count=0, not vanish from
         // the result set. See domain::analytics::StudentActivity doc comment.
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, StudentActivityRow>(
-            r#"SELECT u.id AS student_id, u.name AS student_name, st.rombel_code,
+            r#"SELECT u.public_id AS student_id, u.full_name AS student_name, sp.rombel_code,
                       COUNT(a.id) AS attempts_count,
                       MAX(a.score) AS best_score,
                       AVG(a.score)::float8 AS average_score,
                       MAX(a.submitted_at) AS last_attempt_at
-               FROM users u
-               LEFT JOIN students st ON st.user_id = u.id
-               LEFT JOIN attempts a ON a.student_id = u.id AND a.status = 'submitted'
-               WHERE u.role = 'student' AND u.school_id = $1
-               GROUP BY u.id, u.name, st.rombel_code
-               ORDER BY u.name ASC"#,
+               FROM core.akun u
+               JOIN core.role r ON r.id = u.role_id AND r.kode = 'SISWA'
+               JOIN core.tenant t ON t.id = u.tenant_id
+               LEFT JOIN ptn.student_profile sp ON sp.akun_id = u.id
+               LEFT JOIN ptn.attempts a ON a.student_id = u.id AND a.status = 'submitted'
+               WHERE t.public_id = $1
+               GROUP BY u.id, u.public_id, u.full_name, sp.rombel_code
+               ORDER BY u.full_name ASC"#,
         )
         .bind(school_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()

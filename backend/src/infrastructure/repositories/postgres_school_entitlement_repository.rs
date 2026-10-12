@@ -19,7 +19,7 @@ impl PostgresSchoolEntitlementRepository {
 
 #[derive(sqlx::FromRow)]
 struct EntitlementRow {
-    id: Uuid,
+    public_id: Uuid,
     school_id: Uuid,
     school_name: String,
     package_id: Uuid,
@@ -35,7 +35,7 @@ struct EntitlementRow {
 impl From<EntitlementRow> for SchoolPackageEntitlement {
     fn from(r: EntitlementRow) -> Self {
         SchoolPackageEntitlement {
-            id: r.id,
+            id: r.public_id,
             school_id: r.school_id,
             school_name: r.school_name,
             package_id: r.package_id,
@@ -50,61 +50,101 @@ impl From<EntitlementRow> for SchoolPackageEntitlement {
     }
 }
 
+// `ptn.school_package_entitlements` itself carries no `tenant_id`/RLS (scoped
+// transitively by `school_id`, and read by both Admin (cross-tenant) and the owning
+// School — see `AccessService`/`SchoolPortalService` callers) — but every method here
+// JOINs to `core.tenant`/`ptn.packages`/`core.akun`, which DO carry RLS. Querying by an
+// explicit `school_id`/`id` is already a precise-enough scope (no broad tenant scan
+// happens here), so every method opens its own transaction with
+// `app.is_platform_admin = true` to bypass that RLS check safely, rather than relying on
+// ambient GUC state from whatever connection the pool hands back — a transaction-local
+// `set_config` resets to an EMPTY STRING (not "unset") on commit, and an empty string fed
+// into another table's `current_setting(...)::bigint` RLS check is a hard Postgres error.
+async fn set_platform_admin(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> AppResult<()> {
+    sqlx::query("SELECT set_config('app.tenant_id', '0', true), set_config('app.is_platform_admin', 'true', true)")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 const SELECT_ENTITLEMENT: &str = r#"
-    SELECT e.id, e.school_id, s.name AS school_name, e.package_id, p.name AS package_name,
-           e.starts_at, e.expires_at, e.note, e.granted_by, u.name AS granted_by_name, e.created_at
-    FROM school_package_entitlements e
-    JOIN schools s ON s.id = e.school_id
-    JOIN packages p ON p.id = e.package_id
-    JOIN users u ON u.id = e.granted_by
+    SELECT e.public_id, t.public_id AS school_id, t.name AS school_name, p.public_id AS package_id, p.name AS package_name,
+           e.starts_at, e.expires_at, e.note,
+           a.public_id AS granted_by, a.full_name AS granted_by_name, e.created_at
+    FROM ptn.school_package_entitlements e
+    JOIN core.tenant t ON t.id = e.school_id
+    JOIN ptn.packages p ON p.id = e.package_id
+    JOIN core.akun a ON a.id = e.granted_by
 "#;
 
 #[async_trait]
 impl SchoolEntitlementRepository for PostgresSchoolEntitlementRepository {
     async fn create(&self, input: NewSchoolEntitlement) -> AppResult<SchoolPackageEntitlement> {
-        let id = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO school_package_entitlements
-                (id, school_id, package_id, starts_at, expires_at, note, granted_by)
-               VALUES ($1,$2,$3,$4,$5,$6,$7)"#,
+        let mut tx = self.pool.begin().await?;
+        set_platform_admin(&mut tx).await?;
+
+        let school_id: i64 = sqlx::query_scalar("SELECT id FROM core.tenant WHERE public_id = $1")
+            .bind(input.school_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let package_id: i64 = sqlx::query_scalar("SELECT id FROM ptn.packages WHERE public_id = $1")
+            .bind(input.package_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let granted_by: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(input.granted_by)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let public_id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO ptn.school_package_entitlements
+                (school_id, package_id, starts_at, expires_at, note, granted_by)
+               VALUES ($1,$2,$3,$4,$5,$6)
+               RETURNING public_id"#,
         )
-        .bind(id)
-        .bind(input.school_id)
-        .bind(input.package_id)
+        .bind(school_id)
+        .bind(package_id)
         .bind(input.starts_at)
         .bind(input.expires_at)
         .bind(&input.note)
-        .bind(input.granted_by)
-        .execute(&self.pool)
+        .bind(granted_by)
+        .fetch_one(&mut *tx)
         .await?;
 
-        let row = sqlx::query_as::<_, EntitlementRow>(&format!("{SELECT_ENTITLEMENT} WHERE e.id = $1"))
-            .bind(id)
-            .fetch_one(&self.pool)
+        let row = sqlx::query_as::<_, EntitlementRow>(&format!("{SELECT_ENTITLEMENT} WHERE e.public_id = $1"))
+            .bind(public_id)
+            .fetch_one(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(row.into())
     }
 
     async fn find_by_id(&self, id: Uuid) -> AppResult<Option<SchoolPackageEntitlement>> {
-        let row = sqlx::query_as::<_, EntitlementRow>(&format!("{SELECT_ENTITLEMENT} WHERE e.id = $1"))
+        let mut tx = self.pool.begin().await?;
+        set_platform_admin(&mut tx).await?;
+        let row = sqlx::query_as::<_, EntitlementRow>(&format!("{SELECT_ENTITLEMENT} WHERE e.public_id = $1"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(row.map(Into::into))
     }
 
     async fn list_by_school(&self, school_id: Uuid) -> AppResult<Vec<SchoolPackageEntitlement>> {
+        let mut tx = self.pool.begin().await?;
+        set_platform_admin(&mut tx).await?;
         let rows = sqlx::query_as::<_, EntitlementRow>(&format!(
-            "{SELECT_ENTITLEMENT} WHERE e.school_id = $1 ORDER BY e.created_at DESC"
+            "{SELECT_ENTITLEMENT} WHERE t.public_id = $1 ORDER BY e.created_at DESC"
         ))
         .bind(school_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
     async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM school_package_entitlements WHERE id = $1")
+        let result = sqlx::query("DELETE FROM ptn.school_package_entitlements WHERE public_id = $1")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -112,28 +152,38 @@ impl SchoolEntitlementRepository for PostgresSchoolEntitlementRepository {
     }
 
     async fn has_active_entitlement(&self, school_id: Uuid, today: NaiveDate) -> AppResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        set_platform_admin(&mut tx).await?;
         let exists: bool = sqlx::query_scalar(
             r#"SELECT EXISTS(
-                SELECT 1 FROM school_package_entitlements
-                WHERE school_id = $1 AND starts_at <= $2 AND (expires_at IS NULL OR expires_at >= $2)
+                SELECT 1 FROM ptn.school_package_entitlements e
+                JOIN core.tenant t ON t.id = e.school_id
+                WHERE t.public_id = $1 AND e.starts_at <= $2 AND (e.expires_at IS NULL OR e.expires_at >= $2)
             )"#,
         )
         .bind(school_id)
         .bind(today)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(exists)
     }
 
     async fn active_entitlement_package_ids(&self, school_id: Uuid, today: NaiveDate) -> AppResult<Vec<Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        set_platform_admin(&mut tx).await?;
         let ids: Vec<Uuid> = sqlx::query_scalar(
-            r#"SELECT DISTINCT package_id FROM school_package_entitlements
-               WHERE school_id = $1 AND starts_at <= $2 AND (expires_at IS NULL OR expires_at >= $2)"#,
+            r#"SELECT DISTINCT p.public_id
+               FROM ptn.school_package_entitlements e
+               JOIN core.tenant t ON t.id = e.school_id
+               JOIN ptn.packages p ON p.id = e.package_id
+               WHERE t.public_id = $1 AND e.starts_at <= $2 AND (e.expires_at IS NULL OR e.expires_at >= $2)"#,
         )
         .bind(school_id)
         .bind(today)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ids)
     }
 }

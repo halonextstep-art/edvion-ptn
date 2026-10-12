@@ -65,7 +65,9 @@ use edvionptn_backend::interfaces::http::middleware::AuthUser;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     // See module doc comment — this binary seeds fake accounts/content with publicly-documented
     // passwords, so it refuses to run at all unless explicitly confirmed via env var.
@@ -83,7 +85,8 @@ async fn main() -> anyhow::Result<()> {
     db::run_migrations(&pool).await?;
 
     // ─── Services (same composition as main.rs) ──────────────────────────────────────
-    let user_repo = Arc::new(PostgresUserRepository::new(pool.clone()));
+    let auth_lookup_pool = db::create_pool(&config.auth_lookup_database_url).await?;
+    let user_repo = Arc::new(PostgresUserRepository::new(pool.clone(), auth_lookup_pool.clone()));
     let question_repo = Arc::new(PostgresQuestionRepository::new(pool.clone()));
     let question_set_repo = Arc::new(PostgresQuestionSetRepository::new(pool.clone()));
     let session_repo = Arc::new(PostgresTryoutSessionRepository::new(pool.clone()));
@@ -115,8 +118,8 @@ async fn main() -> anyhow::Result<()> {
     let lockdown_violation_repo = Arc::new(PostgresLockdownViolationRepository::new(pool.clone()));
     let jwt = Arc::new(JwtService::new(config.jwt_secret.clone(), config.jwt_expiry_hours));
 
-    let auth_service = AuthService::new(user_repo.clone(), jwt);
-    let question_service = QuestionService::new(question_repo.clone(), question_set_repo.clone());
+    let auth_service = AuthService::new(user_repo.clone(), jwt, auth_lookup_pool.clone());
+    let question_service = Arc::new(QuestionService::new(question_repo.clone(), question_set_repo.clone()));
     let event_service = EventService::new(event_repo, session_repo.clone());
     let access_service = Arc::new(AccessService::new(
         entitlement_repo,
@@ -163,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
         simulation_template_repo,
         tryout_service.clone(),
         simulation_service,
+        question_service.clone(),
     );
     let voucher_service = VoucherService::new(voucher_repo, package_repo);
     let taxonomy_service = TaxonomyService::new(taxonomy_repo);
@@ -191,18 +195,19 @@ async fn main() -> anyhow::Result<()> {
         snbt_tracking_repo,
         snbp_participation_repo,
         simulation_run_repo,
+        tryout_service.clone(),
     );
 
     // ─── Admin account first — every other seeded row goes through a service that
     // requires an authenticated Admin actor, so there is no raw-SQL/bypass path left. ──
-    let admin = register_or_skip(&auth_service, "Admin Pusat", "admin@edvionptn.id", "admin123", Role::Admin, None).await?;
-    let admin_actor = AuthUser { user_id: admin.id, email: admin.email.clone(), role: Role::Admin };
+    let admin = register_or_skip(&auth_service, &pool, "Admin Pusat", "admin@edvionptn.id", "admin123", Role::Admin, None).await?;
+    let admin_actor = AuthUser { user_id: admin.id, email: admin.email.clone(), role: Role::Admin, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
 
     // ─── Content team (create/edit soal, submit for review) ─────────────────────────
-    let content1 = register_or_skip(&auth_service, "Tim Konten Edvion", "konten@edvion.id", "konten123", Role::Content, None).await?;
-    let content1_actor = AuthUser { user_id: content1.id, email: content1.email.clone(), role: Role::Content };
-    let content2 = register_or_skip(&auth_service, "Rina Marlina", "rina.konten@edvion.id", "konten123", Role::Content, None).await?;
-    let _content2_actor = AuthUser { user_id: content2.id, email: content2.email.clone(), role: Role::Content };
+    let content1 = register_or_skip(&auth_service, &pool, "Tim Konten Edvion", "konten@edvion.id", "konten123", Role::Content, None).await?;
+    let content1_actor = AuthUser { user_id: content1.id, email: content1.email.clone(), role: Role::Content, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
+    let content2 = register_or_skip(&auth_service, &pool, "Rina Marlina", "rina.konten@edvion.id", "konten123", Role::Content, None).await?;
+    let _content2_actor = AuthUser { user_id: content2.id, email: content2.email.clone(), role: Role::Content, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
 
     // ─── Schools (created via SchoolService, same code path the admin UI uses) ──────
     type SchoolSeed = (&'static str, SchoolType, &'static str, &'static str, &'static str, &'static str, PackageType, &'static str);
@@ -251,10 +256,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ─── School PIC accounts (one per school) — captured (not discarded) so they can act
     // as the actor for seeding Kaka Kelas/Eligible below. ─────────────────────────────
-    let pic_sman1 = register_or_skip(&auth_service, "SMA Negeri 1 Jakarta", "sekolah@sman1.sch.id", "sekolah123", Role::School, Some(sman1)).await?;
-    let pic_sman3 = register_or_skip(&auth_service, "SMA Negeri 3 Surabaya", "pic@sman3sby.sch.id", "sekolah123", Role::School, Some(sman3)).await?;
-    let pic_man1 = register_or_skip(&auth_service, "MA Negeri 1 Yogyakarta", "pic@man1yk.sch.id", "sekolah123", Role::School, Some(man1)).await?;
-    let pic_smkn2 = register_or_skip(&auth_service, "SMK Negeri 2 Bandung", "pic@smkn2bdg.sch.id", "sekolah123", Role::School, Some(smkn2)).await?;
+    let pic_sman1 = register_or_skip(&auth_service, &pool, "SMA Negeri 1 Jakarta", "sekolah@sman1.sch.id", "sekolah123", Role::School, Some(sman1)).await?;
+    let pic_sman3 = register_or_skip(&auth_service, &pool, "SMA Negeri 3 Surabaya", "pic@sman3sby.sch.id", "sekolah123", Role::School, Some(sman3)).await?;
+    let pic_man1 = register_or_skip(&auth_service, &pool, "MA Negeri 1 Yogyakarta", "pic@man1yk.sch.id", "sekolah123", Role::School, Some(man1)).await?;
+    let pic_smkn2 = register_or_skip(&auth_service, &pool, "SMK Negeri 2 Bandung", "pic@smkn2bdg.sch.id", "sekolah123", Role::School, Some(smkn2)).await?;
     let school_pics: Vec<User> = vec![pic_sman1, pic_sman3, pic_man1, pic_smkn2];
 
     // ─── Students across all 4 schools ───────────────────────────────────────────────
@@ -275,7 +280,7 @@ async fn main() -> anyhow::Result<()> {
     ];
     let mut students: Vec<User> = Vec::new();
     for (name, email, school_id) in student_seeds {
-        let s = register_or_skip(&auth_service, name, email, "siswa123", Role::Student, Some(school_id)).await?;
+        let s = register_or_skip(&auth_service, &pool, name, email, "siswa123", Role::Student, Some(school_id)).await?;
         students.push(s);
     }
 
@@ -346,10 +351,11 @@ async fn main() -> anyhow::Result<()> {
 
     for (idx, student) in students.iter().enumerate() {
         let Some((base, achievement, snbp_targets, snbt_targets)) = profiles.get(idx) else { continue };
-        let student_actor = AuthUser { user_id: student.id, email: student.email.clone(), role: Role::Student };
+        let student_ctx = tenant_ctx_for(&pool, Role::Student, student.school_id).await?;
+        let student_actor = AuthUser { user_id: student.id, email: student.email.clone(), role: Role::Student, tenant: student_ctx };
 
         // Rapor — skip kalau siswa ini sudah punya nilai (idempotent re-run).
-        if rationalization_service.list_rapor_for(student.id).await.unwrap_or_default().is_empty() {
+        if rationalization_service.list_rapor_for(student.id, &student_ctx).await.unwrap_or_default().is_empty() {
             let entries: Vec<RaporEntryInput> = [4, 5]
                 .into_iter()
                 .flat_map(|sem| {
@@ -361,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
                     })
                 })
                 .collect();
-            match rationalization_service.upsert_rapor_for(student.id, entries).await {
+            match rationalization_service.upsert_rapor_for(student.id, entries, &student_ctx).await {
                 Ok(saved) => rapor_seeded += saved.len(),
                 Err(e) => println!("skip rapor ({}): {e}", student.name),
             }
@@ -369,12 +375,13 @@ async fn main() -> anyhow::Result<()> {
 
         // Prestasi (opsional per siswa).
         if let Some((nama, tingkat, tahun, juara)) = achievement {
-            let existing = rationalization_service.list_achievements_for(student.id).await.unwrap_or_default();
+            let existing = rationalization_service.list_achievements_for(student.id, &student_ctx).await.unwrap_or_default();
             if !existing.iter().any(|a| a.nama == *nama) {
                 match rationalization_service
                     .add_achievement_for(
                         student.id,
                         AchievementInput { nama: (*nama).to_string(), tingkat: *tingkat, tahun: *tahun, juara: (*juara).to_string() },
+                        &student_ctx,
                     )
                     .await
                 {
@@ -385,7 +392,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Target PTN (SNBP & SNBT) — dicari dari katalog nyata per keyword.
-        let existing_targets = rationalization_service.targets_with_chance_for(student.id).await.unwrap_or_default();
+        let existing_targets = rationalization_service.targets_with_chance_for(student.id, &student_ctx).await.unwrap_or_default();
         for (track, keyword_priorities) in [(Track::Snbp, snbp_targets), (Track::Snbt, snbt_targets)] {
             for &(keyword, priority) in keyword_priorities.iter() {
                 let Some(pid) = find_program_id(&rationalization_service, &admin_actor, keyword).await else {
@@ -395,7 +402,7 @@ async fn main() -> anyhow::Result<()> {
                 if existing_targets.iter().any(|t| t.program.id == pid && t.target.track == track) {
                     continue;
                 }
-                match rationalization_service.add_target_for(student.id, pid, track, priority).await {
+                match rationalization_service.add_target_for(student.id, pid, track, priority, &student_ctx).await {
                     Ok(_) => target_seeded += 1,
                     Err(e) => println!("skip target {track:?} ({} / {keyword}): {e}", student.name),
                 }
@@ -425,7 +432,8 @@ async fn main() -> anyhow::Result<()> {
     let mut alumni_seeded = 0usize;
     let mut eligibility_seeded = 0usize;
     for pic in &school_pics {
-        let pic_actor = AuthUser { user_id: pic.id, email: pic.email.clone(), role: Role::School };
+        let pic_ctx = tenant_ctx_for(&pool, Role::School, pic.school_id).await?;
+        let pic_actor = AuthUser { user_id: pic.id, email: pic.email.clone(), role: Role::School, tenant: pic_ctx };
 
         let existing_alumni = school_rationalization_service.list_alumni(&pic_actor).await.unwrap_or_default();
         for (name, year, track, ptn, prodi, score) in &alumni_seeds {
@@ -467,7 +475,8 @@ async fn main() -> anyhow::Result<()> {
     for (idx, student) in students.iter().enumerate() {
         let Some(school_id) = student.school_id else { continue };
         let Some(pic) = school_pics.iter().find(|p| p.school_id == Some(school_id)) else { continue };
-        let pic_actor = AuthUser { user_id: pic.id, email: pic.email.clone(), role: Role::School };
+        let pic_ctx = tenant_ctx_for(&pool, Role::School, pic.school_id).await?;
+        let pic_actor = AuthUser { user_id: pic.id, email: pic.email.clone(), role: Role::School, tenant: pic_ctx };
 
         if school_rationalization_service.snbp_roster(&pic_actor).await.is_ok_and(|roster| {
             roster.iter().any(|r| r.student_id == student.id && !r.konsultan.is_empty())
@@ -1024,7 +1033,8 @@ async fn main() -> anyhow::Result<()> {
     let mut seeded_attempts = 0;
     for (student_idx, session_title, days_ago, correct_pct) in attempt_plan {
         let Some(student) = students.get(student_idx) else { continue };
-        let student_actor = AuthUser { user_id: student.id, email: student.email.clone(), role: Role::Student };
+        let student_ctx = tenant_ctx_for(&pool, Role::Student, student.school_id).await?;
+        let student_actor = AuthUser { user_id: student.id, email: student.email.clone(), role: Role::Student, tenant: student_ctx };
         let Some(&session_id) = sessions.get(session_title) else { continue };
 
         // Re-run safety: skip if this student already has an attempt on this session
@@ -1075,7 +1085,7 @@ async fn simulate_attempt(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     for (idx, playable) in started.questions.iter().enumerate() {
-        let full: Question = question_service.get(playable.id).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let full: Question = question_service.get(playable.id, &student_actor.tenant).await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let seed = mix(session_id, student_actor.user_id, idx as u64);
         let answer_correct = (seed % 100) < correct_pct;
         let answer_text = if answer_correct {
@@ -1098,12 +1108,19 @@ async fn simulate_attempt(
     // Backdate — purely cosmetic for the demo trend chart, scores already computed above.
     let submitted_at = Utc::now() - Duration::days(days_ago);
     let started_at = submitted_at - Duration::minutes(time_used as i64 / 60 + 5);
-    sqlx::query("UPDATE attempts SET started_at = $2, submitted_at = $3 WHERE id = $1")
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true), set_config('app.is_platform_admin', $2, true)")
+        .bind(student_actor.tenant.tenant_id.to_string())
+        .bind(if student_actor.tenant.is_platform_admin { "true" } else { "false" })
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE ptn.attempts SET started_at = $2, submitted_at = $3 WHERE public_id = $1")
         .bind(started.attempt.id)
         .bind(started_at)
         .bind(submitted_at)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     Ok(())
 }
@@ -1126,8 +1143,30 @@ fn wrong_answer(q: &Question) -> String {
     "999999".to_string()
 }
 
+/// Mirrors `TenantCtx::for_role` + `AuthService`'s own tenant resolution (see
+/// `AuthService::register`/`login`): Admin/Content are platform-scoped; School/Student
+/// resolve to their real `core.tenant.id` behind `school_id` (a B2C student with no
+/// `school_id` falls back to the reserved platform tenant, as a non-admin).
+async fn tenant_ctx_for(pool: &sqlx::PgPool, role: Role, school_id: Option<Uuid>) -> anyhow::Result<edvionptn_backend::domain::tenant::TenantCtx> {
+    use edvionptn_backend::domain::tenant::TenantCtx;
+    if role.is_platform_scoped() {
+        return Ok(TenantCtx::platform_admin());
+    }
+    let tenant_id = match school_id {
+        Some(public_id) => {
+            sqlx::query_scalar::<_, i64>("SELECT id FROM core.tenant WHERE public_id = $1")
+                .bind(public_id)
+                .fetch_one(pool)
+                .await?
+        }
+        None => TenantCtx::PLATFORM_TENANT_ID,
+    };
+    Ok(TenantCtx::school(tenant_id))
+}
+
 async fn register_or_skip(
     auth: &AuthService,
+    pool: &sqlx::PgPool,
     name: &str,
     email: &str,
     password: &str,
@@ -1150,12 +1189,13 @@ async fn register_or_skip(
             // through the real app under the same email), don't abort the whole run: fetch
             // the row directly and force its password back to the one this script documents,
             // so the "Seed complete. Demo logins:" printout at the end always stays true.
-            match auth.login(email, password).await {
+            match auth.login(email, None, password).await {
                 Ok(res) => Ok(res.user),
                 Err(_) => match auth.find_by_email(email).await? {
                     Some(user) => {
                         println!("resetting password for existing account: {email} (didn't match expected seed password)");
-                        Ok(auth.reset_password_for_seed(&user, password).await?)
+                        let ctx = tenant_ctx_for(pool, role, school_id).await?;
+                        Ok(auth.reset_password_for_seed(&user, password, &ctx).await?)
                     }
                     None => Err(anyhow::anyhow!("could not create or find {email}: account does not exist and creation failed")),
                 },

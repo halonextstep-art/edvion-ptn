@@ -4,15 +4,22 @@
 //! that file are private, so rather than widen their visibility for this one extra caller,
 //! this file duplicates the minimal question column list it needs (less invasive than
 //! touching an existing, working repository's encapsulation).
+//!
+//! `ptn.question_sets` carries RLS (`tenant_id`); `ptn.question_set_items` does not (scoped
+//! transitively via `set_id -> question_sets.tenant_id`, see that table's doc comment in
+//! `20260101000003_ptn_core_content.sql`) — every method still opens an RLS-scoped
+//! transaction via `begin_tx` regardless, since `ptn.questions` (joined for `list_items`/
+//! `approved_items_for_session`) and `ptn.question_sets` itself both need the GUCs set first.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::{types::Json, PgPool};
+use sqlx::{types::Json, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::domain::question::Question;
 use crate::domain::question_set::QuestionSet;
 use crate::domain::repository::QuestionSetRepository;
+use crate::domain::tenant::TenantCtx;
 use crate::domain::tryout::SessionType;
 use crate::error::{AppError, AppResult};
 
@@ -24,16 +31,29 @@ impl PostgresQuestionSetRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// See `postgres_user_repository.rs::begin_tx` doc comment.
+    async fn begin_tx(&self, ctx: &TenantCtx) -> AppResult<Transaction<'static, Postgres>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('app.is_platform_admin', $2, true)",
+        )
+        .bind(ctx.tenant_id.to_string())
+        .bind(if ctx.is_platform_admin { "true" } else { "false" })
+        .execute(&mut *tx)
+        .await?;
+        Ok(tx)
+    }
 }
 
 // ─── question_sets row mapping ───────────────────────────────────────────────────
 
 #[derive(sqlx::FromRow)]
 struct QuestionSetRow {
-    id: Uuid,
+    public_id: Uuid,
     name: String,
     description: String,
-    created_by: Uuid,
+    created_by_public_id: Uuid,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     item_count: i64,
@@ -42,10 +62,10 @@ struct QuestionSetRow {
 impl From<QuestionSetRow> for QuestionSet {
     fn from(r: QuestionSetRow) -> Self {
         QuestionSet {
-            id: r.id,
+            id: r.public_id,
             name: r.name,
             description: r.description,
-            created_by: r.created_by,
+            created_by: r.created_by_public_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
             item_count: r.item_count,
@@ -58,15 +78,17 @@ impl From<QuestionSetRow> for QuestionSet {
 // single-row lookups alike — same pattern as `created_by_name` in
 // `postgres_question_repository.rs`.
 const SELECT_SET_COLUMNS: &str = r#"
-    id, name, description, created_by, created_at, updated_at,
-    (SELECT COUNT(*) FROM question_set_items WHERE question_set_items.set_id = question_sets.id) AS item_count
+    public_id, name, description,
+    (SELECT public_id FROM core.akun WHERE core.akun.id = ptn.question_sets.created_by) AS created_by_public_id,
+    created_at, updated_at,
+    (SELECT COUNT(*) FROM ptn.question_set_items WHERE ptn.question_set_items.set_id = ptn.question_sets.id) AS item_count
 "#;
 
 // ─── questions row mapping (duplicated minimal subset — see module doc comment) ──
 
 #[derive(sqlx::FromRow)]
 struct SetQuestionRow {
-    id: Uuid,
+    public_id: Uuid,
     code: String,
     question_type: String,
     subject: String,
@@ -82,9 +104,9 @@ struct SetQuestionRow {
     tags: Vec<String>,
     status: String,
     review_note: Option<String>,
-    reviewed_by: Option<Uuid>,
+    reviewed_by_public_id: Option<Uuid>,
     reviewed_at: Option<DateTime<Utc>>,
-    created_by: Uuid,
+    created_by_public_id: Uuid,
     created_by_name: String,
     usage_count: i32,
     average_score: f64,
@@ -98,7 +120,7 @@ impl TryFrom<SetQuestionRow> for Question {
 
     fn try_from(r: SetQuestionRow) -> Result<Self, Self::Error> {
         Ok(Question {
-            id: r.id,
+            id: r.public_id,
             code: r.code,
             question_type: r
                 .question_type
@@ -123,9 +145,9 @@ impl TryFrom<SetQuestionRow> for Question {
                 .parse()
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("corrupt status: {e}")))?,
             review_note: r.review_note,
-            reviewed_by: r.reviewed_by,
+            reviewed_by: r.reviewed_by_public_id,
             reviewed_at: r.reviewed_at,
-            created_by: r.created_by,
+            created_by: r.created_by_public_id,
             created_by_name: r.created_by_name,
             usage_count: r.usage_count,
             average_score: r.average_score,
@@ -137,131 +159,168 @@ impl TryFrom<SetQuestionRow> for Question {
 }
 
 const SELECT_SET_QUESTION_COLUMNS: &str = r#"
-    q.id, q.code, q.question_type, q.subject, q.topic, q.subtopic, q.difficulty, q.bloom_level,
+    q.public_id, q.code, q.question_type, q.subject, q.topic, q.subtopic, q.difficulty, q.bloom_level,
     q.stimulus, q.question_text, q.options, q.correct_answer, q.explanation, q.tags, q.status,
-    q.review_note, q.reviewed_by, q.reviewed_at, q.created_by,
-    (SELECT name FROM users WHERE users.id = q.created_by) AS created_by_name,
+    q.review_note,
+    (SELECT public_id FROM core.akun WHERE core.akun.id = q.reviewed_by) AS reviewed_by_public_id,
+    q.reviewed_at,
+    (SELECT public_id FROM core.akun WHERE core.akun.id = q.created_by) AS created_by_public_id,
+    (SELECT full_name FROM core.akun WHERE core.akun.id = q.created_by) AS created_by_name,
     q.usage_count, q.average_score, q.time_limit, q.created_at, q.updated_at
 "#;
 
 #[async_trait]
 impl QuestionSetRepository for PostgresQuestionSetRepository {
-    async fn create(&self, name: String, description: String, created_by: Uuid) -> AppResult<QuestionSet> {
-        let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO question_sets (id, name, description, created_by) VALUES ($1,$2,$3,$4)")
-            .bind(id)
-            .bind(&name)
-            .bind(&description)
+    async fn create(&self, name: String, description: String, created_by: Uuid, ctx: &TenantCtx) -> AppResult<QuestionSet> {
+        let mut tx = self.begin_tx(ctx).await?;
+
+        let created_by_id: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
             .bind(created_by)
-            .execute(&self.pool)
-            .await?;
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("created_by lookup failed: {e}")))?;
+
+        let set_id: i64 = sqlx::query_scalar(
+            "INSERT INTO ptn.question_sets (name, description, created_by) VALUES ($1,$2,$3) RETURNING id",
+        )
+        .bind(&name)
+        .bind(&description)
+        .bind(created_by_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
         let row = sqlx::query_as::<_, QuestionSetRow>(&format!(
-            "SELECT {SELECT_SET_COLUMNS} FROM question_sets WHERE id = $1"
+            "SELECT {SELECT_SET_COLUMNS} FROM ptn.question_sets WHERE id = $1"
         ))
-        .bind(id)
-        .fetch_one(&self.pool)
+        .bind(set_id)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row.into())
     }
 
-    async fn list(&self) -> AppResult<Vec<QuestionSet>> {
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<QuestionSet>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, QuestionSetRow>(&format!(
-            "SELECT {SELECT_SET_COLUMNS} FROM question_sets ORDER BY created_at DESC"
+            "SELECT {SELECT_SET_COLUMNS} FROM ptn.question_sets ORDER BY created_at DESC"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(QuestionSet::from).collect())
     }
 
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<QuestionSet>> {
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<QuestionSet>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let row = sqlx::query_as::<_, QuestionSetRow>(&format!(
-            "SELECT {SELECT_SET_COLUMNS} FROM question_sets WHERE id = $1"
+            "SELECT {SELECT_SET_COLUMNS} FROM ptn.question_sets WHERE public_id = $1"
         ))
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row.map(QuestionSet::from))
     }
 
-    async fn update(&self, id: Uuid, name: String, description: String) -> AppResult<Option<QuestionSet>> {
-        let result = sqlx::query("UPDATE question_sets SET name = $2, description = $3, updated_at = now() WHERE id = $1")
+    async fn update(&self, id: Uuid, name: String, description: String, ctx: &TenantCtx) -> AppResult<Option<QuestionSet>> {
+        let mut tx = self.begin_tx(ctx).await?;
+        let result = sqlx::query("UPDATE ptn.question_sets SET name = $2, description = $3, updated_at = now() WHERE public_id = $1")
             .bind(id)
             .bind(&name)
             .bind(&description)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Ok(None);
         }
         let row = sqlx::query_as::<_, QuestionSetRow>(&format!(
-            "SELECT {SELECT_SET_COLUMNS} FROM question_sets WHERE id = $1"
+            "SELECT {SELECT_SET_COLUMNS} FROM ptn.question_sets WHERE public_id = $1"
         ))
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(row.map(QuestionSet::from))
     }
 
-    async fn delete(&self, id: Uuid) -> AppResult<bool> {
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
         // `tryout_sessions.question_set_id` is `ON DELETE SET NULL`, so this never fails
         // with a foreign-key conflict — a session referencing this set just falls back to
         // its original filter fields.
-        let result = sqlx::query("DELETE FROM question_sets WHERE id = $1")
+        let mut tx = self.begin_tx(ctx).await?;
+        let result = sqlx::query("DELETE FROM ptn.question_sets WHERE public_id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
-    async fn list_items(&self, set_id: Uuid) -> AppResult<Vec<Question>> {
+    async fn list_items(&self, set_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Question>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, SetQuestionRow>(&format!(
             r#"SELECT {SELECT_SET_QUESTION_COLUMNS}
-               FROM questions q
-               JOIN question_set_items qsi ON qsi.question_id = q.id
-               WHERE qsi.set_id = $1
+               FROM ptn.questions q
+               JOIN ptn.question_set_items qsi ON qsi.question_id = q.id
+               JOIN ptn.question_sets qs ON qs.id = qsi.set_id
+               WHERE qs.public_id = $1
                ORDER BY qsi.sort_order ASC"#
         ))
         .bind(set_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         rows.into_iter().map(Question::try_from).collect()
     }
 
-    async fn add_item(&self, set_id: Uuid, question_id: Uuid, sort_order: i32) -> AppResult<()> {
+    async fn add_item(&self, set_id: Uuid, question_id: Uuid, sort_order: i32, ctx: &TenantCtx) -> AppResult<()> {
         // Adding a question already in the set is a no-op success (idempotent), not an
         // error — the question authoring form calls this on every save of a question that
         // has a set assigned, including re-saves of an already-assigned question.
+        let mut tx = self.begin_tx(ctx).await?;
         sqlx::query(
-            r#"INSERT INTO question_set_items (id, set_id, question_id, sort_order)
-               VALUES ($1, $2, $3, $4)
+            r#"INSERT INTO ptn.question_set_items (set_id, question_id, sort_order)
+               VALUES (
+                   (SELECT id FROM ptn.question_sets WHERE public_id = $1),
+                   (SELECT id FROM ptn.questions WHERE public_id = $2),
+                   $3
+               )
                ON CONFLICT (set_id, question_id) DO NOTHING"#,
         )
-        .bind(Uuid::new_v4())
         .bind(set_id)
         .bind(question_id)
         .bind(sort_order)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn remove_item(&self, set_id: Uuid, question_id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM question_set_items WHERE set_id = $1 AND question_id = $2")
-            .bind(set_id)
-            .bind(question_id)
-            .execute(&self.pool)
-            .await?;
+    async fn remove_item(&self, set_id: Uuid, question_id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let mut tx = self.begin_tx(ctx).await?;
+        let result = sqlx::query(
+            r#"DELETE FROM ptn.question_set_items
+               WHERE set_id = (SELECT id FROM ptn.question_sets WHERE public_id = $1)
+                 AND question_id = (SELECT id FROM ptn.questions WHERE public_id = $2)"#,
+        )
+        .bind(set_id)
+        .bind(question_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
-    async fn approved_items_for_session(&self, set_id: Uuid, session_type: SessionType) -> AppResult<Vec<Question>> {
+    async fn approved_items_for_session(&self, set_id: Uuid, session_type: SessionType, ctx: &TenantCtx) -> AppResult<Vec<Question>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let mut sql = format!(
             r#"SELECT {SELECT_SET_QUESTION_COLUMNS}
-               FROM questions q
-               JOIN question_set_items qsi ON qsi.question_id = q.id
-               WHERE qsi.set_id = $1 AND q.status = 'approved'"#
+               FROM ptn.questions q
+               JOIN ptn.question_set_items qsi ON qsi.question_id = q.id
+               JOIN ptn.question_sets qs ON qs.id = qsi.set_id
+               WHERE qs.public_id = $1 AND q.status = 'approved'"#
         );
         // Same essay-exclusion rule as `QuestionRepository::random_approved` — essay is
         // self-check/Drilling-only, never auto-graded, so it must never be selected into a
@@ -274,8 +333,9 @@ impl QuestionSetRepository for PostgresQuestionSetRepository {
 
         let rows = sqlx::query_as::<_, SetQuestionRow>(&sql)
             .bind(set_id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
         rows.into_iter().map(Question::try_from).collect()
     }
 }

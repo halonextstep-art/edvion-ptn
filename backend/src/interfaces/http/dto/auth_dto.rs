@@ -19,8 +19,16 @@ pub struct RegisterRequest {
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct LoginRequest {
-    #[validate(email(message = "must be a valid email"))]
-    pub email: String,
+    // Accepts either a PTN account's email or a legacy cross-module account's
+    // `core.akun.username` — see `AuthService::login` doc comment for why both exist and
+    // how the lookup disambiguates them. No format validation: usernames aren't emails.
+    #[validate(length(min = 1, message = "username is required"))]
+    pub username: String,
+    // `core.akun.username` is only unique *within* a tenant (e.g. "admin" exists under 18
+    // different schools) — omit this for PTN's own platform-tenant accounts (admin/content/
+    // B2C students), provide it (the school's `core.tenant.slug`) to disambiguate a
+    // cross-module account that belongs to a specific partner school.
+    pub tenant_slug: Option<String>,
     #[validate(length(min = 1, message = "password is required"))]
     pub password: String,
 }

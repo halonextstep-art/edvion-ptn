@@ -24,6 +24,7 @@ use crate::domain::repository::{
     PtnProgramRepository, PtnProgramUpdate, PtnTargetRepository, RaporScoreRepository, RaporScoreUpsert,
     SimulationRunRepository,
 };
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
 use crate::interfaces::http::middleware::AuthUser;
@@ -121,12 +122,12 @@ impl RationalizationService {
     /// student happened to drill individually. Both are rescaled to the same 0-825 UTBK
     /// ballpark before conversion to a percentage of `pg_snbt`, so downstream chance math
     /// is unaffected by which source produced the number.
-    async fn snbt_student_pct(&self, student_id: Uuid) -> AppResult<f64> {
-        let sim_run = self.simulation_runs.latest_completed_for_student(student_id).await?;
+    async fn snbt_student_pct(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<f64> {
+        let sim_run = self.simulation_runs.latest_completed_for_student(student_id, ctx).await?;
         if let Some(score) = sim_run.and_then(|r| r.combined_estimate_score) {
             return Ok((score / UTBK_SCALE_MAX) * 100.0);
         }
-        let attempts = self.attempts.list_by_student(student_id).await?;
+        let attempts = self.attempts.list_by_student(student_id, ctx).await?;
         Ok(average_tryout_score(&attempts).map(|s| (s / PLATFORM_SCALE_MAX) * 100.0).unwrap_or(0.0))
     }
 
@@ -135,37 +136,40 @@ impl RationalizationService {
     /// Core write, no role lock — callers (self-service handler, or the school/admin
     /// "edit on behalf of student" handler after `ensure_owns_student`) decide who's
     /// allowed to reach this for a given `student_id`.
-    pub async fn add_achievement_for(&self, student_id: Uuid, input: AchievementInput) -> AppResult<Achievement> {
+    pub async fn add_achievement_for(&self, student_id: Uuid, input: AchievementInput, ctx: &TenantCtx) -> AppResult<Achievement> {
         if input.nama.trim().is_empty() {
             return Err(AppError::Validation("nama prestasi wajib diisi".to_string()));
         }
         self.achievements
-            .create(NewAchievement {
-                student_id,
-                nama: input.nama,
-                tingkat: input.tingkat,
-                tahun: input.tahun,
-                juara: input.juara,
-            })
+            .create(
+                NewAchievement {
+                    student_id,
+                    nama: input.nama,
+                    tingkat: input.tingkat,
+                    tahun: input.tahun,
+                    juara: input.juara,
+                },
+                ctx,
+            )
             .await
     }
 
     pub async fn add_my_achievement(&self, actor: &AuthUser, input: AchievementInput) -> AppResult<Achievement> {
         actor.require_role(&[Role::Student])?;
-        self.add_achievement_for(actor.user_id, input).await
+        self.add_achievement_for(actor.user_id, input, &actor.tenant).await
     }
 
-    pub async fn list_achievements_for(&self, student_id: Uuid) -> AppResult<Vec<Achievement>> {
-        self.achievements.list_by_student(student_id).await
+    pub async fn list_achievements_for(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Achievement>> {
+        self.achievements.list_by_student(student_id, ctx).await
     }
 
     pub async fn list_my_achievements(&self, actor: &AuthUser) -> AppResult<Vec<Achievement>> {
         actor.require_role(&[Role::Student])?;
-        self.list_achievements_for(actor.user_id).await
+        self.list_achievements_for(actor.user_id, &actor.tenant).await
     }
 
-    pub async fn delete_achievement_for(&self, student_id: Uuid, id: Uuid) -> AppResult<()> {
-        let deleted = self.achievements.delete(student_id, id).await?;
+    pub async fn delete_achievement_for(&self, student_id: Uuid, id: Uuid, ctx: &TenantCtx) -> AppResult<()> {
+        let deleted = self.achievements.delete(student_id, id, ctx).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("prestasi {id} tidak ditemukan")));
         }
@@ -174,7 +178,7 @@ impl RationalizationService {
 
     pub async fn delete_my_achievement(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Student])?;
-        self.delete_achievement_for(actor.user_id, id).await
+        self.delete_achievement_for(actor.user_id, id, &actor.tenant).await
     }
 
     /// Attaches a certificate scan to one of the caller's own achievements. Self-service
@@ -188,7 +192,7 @@ impl RationalizationService {
     ) -> AppResult<Achievement> {
         actor.require_role(&[Role::Student])?;
         self.achievements
-            .set_certificate(actor.user_id, id, certificate_url)
+            .set_certificate(actor.user_id, id, certificate_url, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("prestasi {id} tidak ditemukan")))
     }
@@ -291,7 +295,7 @@ impl RationalizationService {
 
     // ─── Rapor scores (student-owned) ───────────────────────────────────────────
 
-    pub async fn upsert_rapor_for(&self, student_id: Uuid, entries: Vec<RaporEntryInput>) -> AppResult<Vec<RaporScore>> {
+    pub async fn upsert_rapor_for(&self, student_id: Uuid, entries: Vec<RaporEntryInput>, ctx: &TenantCtx) -> AppResult<Vec<RaporScore>> {
         let mut saved = Vec::with_capacity(entries.len());
         for e in entries {
             if !(0.0..=100.0).contains(&e.score) {
@@ -305,6 +309,7 @@ impl RationalizationService {
                     .upsert(
                         student_id,
                         RaporScoreUpsert { semester: e.semester, subject: e.subject, score: e.score, is_minat: e.is_minat },
+                        ctx,
                     )
                     .await?,
             );
@@ -314,20 +319,20 @@ impl RationalizationService {
 
     pub async fn upsert_my_rapor(&self, actor: &AuthUser, entries: Vec<RaporEntryInput>) -> AppResult<Vec<RaporScore>> {
         actor.require_role(&[Role::Student])?;
-        self.upsert_rapor_for(actor.user_id, entries).await
+        self.upsert_rapor_for(actor.user_id, entries, &actor.tenant).await
     }
 
-    pub async fn list_rapor_for(&self, student_id: Uuid) -> AppResult<Vec<RaporScore>> {
-        self.rapor.list_by_student(student_id).await
+    pub async fn list_rapor_for(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<RaporScore>> {
+        self.rapor.list_by_student(student_id, ctx).await
     }
 
     pub async fn list_my_rapor(&self, actor: &AuthUser) -> AppResult<Vec<RaporScore>> {
         actor.require_role(&[Role::Student])?;
-        self.list_rapor_for(actor.user_id).await
+        self.list_rapor_for(actor.user_id, &actor.tenant).await
     }
 
-    pub async fn delete_rapor_for(&self, student_id: Uuid, id: Uuid) -> AppResult<()> {
-        let deleted = self.rapor.delete(student_id, id).await?;
+    pub async fn delete_rapor_for(&self, student_id: Uuid, id: Uuid, ctx: &TenantCtx) -> AppResult<()> {
+        let deleted = self.rapor.delete(student_id, id, ctx).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("nilai rapor {id} tidak ditemukan")));
         }
@@ -336,7 +341,7 @@ impl RationalizationService {
 
     pub async fn delete_my_rapor(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Student])?;
-        self.delete_rapor_for(actor.user_id, id).await
+        self.delete_rapor_for(actor.user_id, id, &actor.tenant).await
     }
 
     // ─── Targets + chance calculation (student-owned; school/admin may edit on
@@ -348,6 +353,7 @@ impl RationalizationService {
         ptn_program_id: Uuid,
         track: Track,
         priority: Priority,
+        ctx: &TenantCtx,
     ) -> AppResult<PtnTarget> {
         // Fail fast with a clean 404 if the program doesn't exist, rather than surfacing a
         // raw FK-violation from Postgres.
@@ -355,10 +361,10 @@ impl RationalizationService {
             .find_by_id(ptn_program_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("program studi {ptn_program_id} tidak ditemukan")))?;
-        let existing = self.targets.list_by_student(student_id).await?;
+        let existing = self.targets.list_by_student(student_id, ctx).await?;
         let sort_order = existing.len() as i32;
         self.targets
-            .create(NewPtnTarget { student_id, ptn_program_id, track, priority, sort_order })
+            .create(NewPtnTarget { student_id, ptn_program_id, track, priority, sort_order }, ctx)
             .await
     }
 
@@ -370,23 +376,23 @@ impl RationalizationService {
         priority: Priority,
     ) -> AppResult<PtnTarget> {
         actor.require_role(&[Role::Student])?;
-        self.add_target_for(actor.user_id, ptn_program_id, track, priority).await
+        self.add_target_for(actor.user_id, ptn_program_id, track, priority, &actor.tenant).await
     }
 
-    pub async fn set_target_priority_for(&self, student_id: Uuid, id: Uuid, priority: Priority) -> AppResult<PtnTarget> {
+    pub async fn set_target_priority_for(&self, student_id: Uuid, id: Uuid, priority: Priority, ctx: &TenantCtx) -> AppResult<PtnTarget> {
         self.targets
-            .set_priority(student_id, id, priority)
+            .set_priority(student_id, id, priority, ctx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("target {id} tidak ditemukan")))
     }
 
     pub async fn set_target_priority(&self, actor: &AuthUser, id: Uuid, priority: Priority) -> AppResult<PtnTarget> {
         actor.require_role(&[Role::Student])?;
-        self.set_target_priority_for(actor.user_id, id, priority).await
+        self.set_target_priority_for(actor.user_id, id, priority, &actor.tenant).await
     }
 
-    pub async fn remove_target_for(&self, student_id: Uuid, id: Uuid) -> AppResult<()> {
-        let deleted = self.targets.delete(student_id, id).await?;
+    pub async fn remove_target_for(&self, student_id: Uuid, id: Uuid, ctx: &TenantCtx) -> AppResult<()> {
+        let deleted = self.targets.delete(student_id, id, ctx).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("target {id} tidak ditemukan")));
         }
@@ -395,31 +401,31 @@ impl RationalizationService {
 
     pub async fn remove_target(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Student])?;
-        self.remove_target_for(actor.user_id, id).await
+        self.remove_target_for(actor.user_id, id, &actor.tenant).await
     }
 
     /// The student's own targets, each bundled with a freshly-computed chance. This is the
     /// main read used by the student Rasionalisasi SNBT page.
     pub async fn my_targets_with_chance(&self, actor: &AuthUser) -> AppResult<Vec<TargetWithChance>> {
         actor.require_role(&[Role::Student])?;
-        self.targets_with_chance_for(actor.user_id).await
+        self.targets_with_chance_for(actor.user_id, &actor.tenant).await
     }
 
     /// Same computation but for an arbitrary student — used by School Rekap SNBT / SNBP
     /// Rasionalisasi tabs (school PIC/admin viewing their own students' targets). Role
     /// enforcement (that the caller is actually allowed to see *this* student) is done by
     /// the caller (school/user service already scopes students to their own school).
-    pub async fn targets_with_chance_for(&self, student_id: Uuid) -> AppResult<Vec<TargetWithChance>> {
-        let targets = self.targets.list_by_student(student_id).await?;
+    pub async fn targets_with_chance_for(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<TargetWithChance>> {
+        let targets = self.targets.list_by_student(student_id, ctx).await?;
         if targets.is_empty() {
             return Ok(Vec::new());
         }
 
-        let rapor = self.rapor.list_by_student(student_id).await?;
+        let rapor = self.rapor.list_by_student(student_id, ctx).await?;
 
-        let student_pct_snbt = self.snbt_student_pct(student_id).await?;
+        let student_pct_snbt = self.snbt_student_pct(student_id, ctx).await?;
 
-        let achievements = self.achievements.list_by_student(student_id).await?;
+        let achievements = self.achievements.list_by_student(student_id, ctx).await?;
         let prestasi_bonus = index_prestasi(&achievements);
 
         let mut out = Vec::with_capacity(targets.len());
@@ -460,7 +466,7 @@ impl RationalizationService {
 
     /// Ad-hoc "what if I target this program" preview — used by the picker UI before the
     /// student commits to adding it as a target, so they see the estimate first.
-    pub async fn preview_chance_for(&self, student_id: Uuid, ptn_program_id: Uuid, track: Track) -> AppResult<ChanceResult> {
+    pub async fn preview_chance_for(&self, student_id: Uuid, ptn_program_id: Uuid, track: Track, ctx: &TenantCtx) -> AppResult<ChanceResult> {
         let program = self
             .programs
             .find_by_id(ptn_program_id)
@@ -469,23 +475,23 @@ impl RationalizationService {
         if !program.has_official_stats {
             let student_value = match track {
                 Track::Snbp => {
-                    let rapor = self.rapor.list_by_student(student_id).await?;
+                    let rapor = self.rapor.list_by_student(student_id, ctx).await?;
                     average_rapor_for_program(&rapor, &program.mapel_syarat).unwrap_or(0.0)
                 }
-                Track::Snbt => self.snbt_student_pct(student_id).await?,
+                Track::Snbt => self.snbt_student_pct(student_id, ctx).await?,
             };
             return Ok(unavailable_chance(student_value));
         }
         let chance = match track {
             Track::Snbp => {
-                let rapor = self.rapor.list_by_student(student_id).await?;
+                let rapor = self.rapor.list_by_student(student_id, ctx).await?;
                 let student_value = average_rapor_for_program(&rapor, &program.mapel_syarat).unwrap_or(0.0);
-                let achievements = self.achievements.list_by_student(student_id).await?;
+                let achievements = self.achievements.list_by_student(student_id, ctx).await?;
                 let prestasi_bonus = index_prestasi(&achievements);
                 compute_chance_snbp(student_value, program.pg_snbp, program.competition_ratio_snbp(), prestasi_bonus)
             }
             Track::Snbt => {
-                let student_pct = self.snbt_student_pct(student_id).await?;
+                let student_pct = self.snbt_student_pct(student_id, ctx).await?;
                 let threshold_pct = (program.pg_snbt / UTBK_SCALE_MAX) * 100.0;
                 compute_chance(student_pct, threshold_pct, program.competition_ratio_snbt())
             }
@@ -495,7 +501,7 @@ impl RationalizationService {
 
     pub async fn preview_chance(&self, actor: &AuthUser, ptn_program_id: Uuid, track: Track) -> AppResult<ChanceResult> {
         actor.require_role(&[Role::Student])?;
-        self.preview_chance_for(actor.user_id, ptn_program_id, track).await
+        self.preview_chance_for(actor.user_id, ptn_program_id, track, &actor.tenant).await
     }
 }
 

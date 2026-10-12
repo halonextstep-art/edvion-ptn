@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::domain::question::Question;
 use crate::domain::question_set::QuestionSet;
 use crate::domain::repository::QuestionSetRepository;
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
 use crate::interfaces::http::middleware::AuthUser;
@@ -27,27 +28,27 @@ impl QuestionSetService {
     }
 
     /// Any authenticated role may browse the catalogue of sets.
-    pub async fn list(&self) -> AppResult<Vec<QuestionSet>> {
-        self.sets.list().await
+    pub async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<QuestionSet>> {
+        self.sets.list(ctx).await
     }
 
     /// Any authenticated role — admin/content need to preview membership while authoring
     /// or assigning a session.
-    pub async fn get_items(&self, set_id: Uuid) -> AppResult<Vec<Question>> {
-        self.sets.list_items(set_id).await
+    pub async fn get_items(&self, set_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<Question>> {
+        self.sets.list_items(set_id, ctx).await
     }
 
     pub async fn create(&self, actor: &AuthUser, name: String, description: String) -> AppResult<QuestionSet> {
         actor.require_role(&[Role::Admin, Role::Content])?;
         validate_name(&name)?;
-        self.sets.create(name, description, actor.user_id).await
+        self.sets.create(name, description, actor.user_id, &actor.tenant).await
     }
 
     pub async fn update(&self, actor: &AuthUser, id: Uuid, name: String, description: String) -> AppResult<QuestionSet> {
         actor.require_role(&[Role::Admin, Role::Content])?;
         validate_name(&name)?;
         self.sets
-            .update(id, name, description)
+            .update(id, name, description, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("question set {id} not found")))
     }
@@ -60,7 +61,7 @@ impl QuestionSetService {
     /// built here to avoid over-engineering.
     pub async fn delete(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin, Role::Content])?;
-        let deleted = self.sets.delete(id).await?;
+        let deleted = self.sets.delete(id, &actor.tenant).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("question set {id} not found")));
         }
@@ -69,13 +70,13 @@ impl QuestionSetService {
 
     pub async fn add_item(&self, actor: &AuthUser, set_id: Uuid, question_id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin, Role::Content])?;
-        let current_items = self.sets.list_items(set_id).await?;
-        self.sets.add_item(set_id, question_id, current_items.len() as i32).await
+        let current_items = self.sets.list_items(set_id, &actor.tenant).await?;
+        self.sets.add_item(set_id, question_id, current_items.len() as i32, &actor.tenant).await
     }
 
     pub async fn remove_item(&self, actor: &AuthUser, set_id: Uuid, question_id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin, Role::Content])?;
-        let removed = self.sets.remove_item(set_id, question_id).await?;
+        let removed = self.sets.remove_item(set_id, question_id, &actor.tenant).await?;
         if !removed {
             return Err(AppError::NotFound(format!(
                 "question {question_id} is not a member of set {set_id}"

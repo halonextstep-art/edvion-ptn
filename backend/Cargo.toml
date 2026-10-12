@@ -23,6 +23,10 @@ chrono = { version = "0.4", features = ["serde"] }
 jsonwebtoken = "9"
 argon2 = "0.5"
 rand_core = { version = "0.6", features = ["std"] }
+# Legacy accounts shared via `core.akun` across other modules (academic/tahfiz/office/etc.)
+# were hashed with bcrypt, not PTN's own Argon2id — `verify_password` needs to support both
+# so those pre-existing accounts can still log into PTN without a forced password reset.
+bcrypt = "0.15"
 
 dotenvy = "0.15"
 tracing = "0.1"

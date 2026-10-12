@@ -3,10 +3,17 @@
 //! "earned by" or "participants" number, they run real SQL against `attempts` /
 //! `attempt_answers` at read time — same philosophy as `PostgresEventRepository`'s live
 //! `participants` join.
+//!
+//! Every method opens its own `begin_tx`/`set_config` transaction (see
+//! `postgres_user_repository::PostgresUserRepository::begin_tx` doc comment for the
+//! pattern this mirrors) since every `ptn.point_rules`/`ptn.badges`/`ptn.challenges` row
+//! carries `tenant_id` + RLS. `created_by` (bigint FK to `core.akun`) is resolved back to
+//! its `public_id` via a scalar subquery in each SELECT, same as
+//! `postgres_event_repository`/`postgres_voucher_repository`.
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::domain::gamification::{
@@ -17,7 +24,18 @@ use crate::domain::repository::{
     BadgeRepository, BadgeUpdate, ChallengeRepository, ChallengeUpdate, LeaderboardParams, LeaderboardRepository,
     NewBadge, NewChallenge, NewPointRule, PointRuleRepository, PointRuleUpdate,
 };
+use crate::domain::tenant::TenantCtx;
 use crate::error::AppResult;
+
+async fn begin_tx(pool: &PgPool, ctx: &TenantCtx) -> AppResult<Transaction<'static, Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true), set_config('app.is_platform_admin', $2, true)")
+        .bind(ctx.tenant_id.to_string())
+        .bind(if ctx.is_platform_admin { "true" } else { "false" })
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
 
 // ─── Point rules ────────────────────────────────────────────────────────────────
 
@@ -33,7 +51,7 @@ impl PostgresPointRuleRepository {
 
 #[derive(sqlx::FromRow)]
 struct PointRuleRow {
-    id: Uuid,
+    public_id: Uuid,
     action: String,
     category: String,
     base_points: i32,
@@ -47,7 +65,7 @@ struct PointRuleRow {
 impl From<PointRuleRow> for PointRule {
     fn from(r: PointRuleRow) -> Self {
         PointRule {
-            id: r.id,
+            id: r.public_id,
             action: r.action,
             category: r.category,
             base_points: r.base_points,
@@ -60,14 +78,19 @@ impl From<PointRuleRow> for PointRule {
     }
 }
 
+const SELECT_POINT_RULE: &str =
+    "SELECT public_id, action, category, base_points, multiplier, enabled, icon, sort_order, created_at FROM ptn.point_rules";
+
 #[async_trait]
 impl PointRuleRepository for PostgresPointRuleRepository {
-    async fn create(&self, n: NewPointRule) -> AppResult<PointRule> {
-        let row = sqlx::query_as::<_, PointRuleRow>(
-            r#"INSERT INTO point_rules (action, category, base_points, multiplier, enabled, icon, sort_order)
-               VALUES ($1,$2,$3,$4,$5,$6,$7)
-               RETURNING id, action, category, base_points, multiplier, enabled, icon, sort_order, created_at"#,
+    async fn create(&self, n: NewPointRule, ctx: &TenantCtx) -> AppResult<PointRule> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let public_id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO ptn.point_rules (tenant_id, action, category, base_points, multiplier, enabled, icon, sort_order)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               RETURNING public_id"#,
         )
+        .bind(ctx.tenant_id)
         .bind(&n.action)
         .bind(&n.category)
         .bind(n.base_points)
@@ -75,37 +98,50 @@ impl PointRuleRepository for PostgresPointRuleRepository {
         .bind(n.enabled)
         .bind(&n.icon)
         .bind(n.sort_order)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        let row = sqlx::query_as::<_, PointRuleRow>(&format!("{SELECT_POINT_RULE} WHERE public_id = $1"))
+            .bind(public_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(row.into())
     }
 
-    async fn list(&self) -> AppResult<Vec<PointRule>> {
-        let rows = sqlx::query_as::<_, PointRuleRow>(
-            "SELECT id, action, category, base_points, multiplier, enabled, icon, sort_order, created_at FROM point_rules ORDER BY sort_order ASC, created_at ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<PointRule>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let rows = sqlx::query_as::<_, PointRuleRow>(&format!("{SELECT_POINT_RULE} ORDER BY sort_order ASC, created_at ASC"))
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    async fn update(&self, id: Uuid, u: PointRuleUpdate) -> AppResult<Option<PointRule>> {
-        let row = sqlx::query_as::<_, PointRuleRow>(
-            r#"UPDATE point_rules SET base_points = $2, multiplier = $3, enabled = $4
-               WHERE id = $1
-               RETURNING id, action, category, base_points, multiplier, enabled, icon, sort_order, created_at"#,
-        )
-        .bind(id)
-        .bind(u.base_points)
-        .bind(u.multiplier)
-        .bind(u.enabled)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(Into::into))
+    async fn update(&self, id: Uuid, u: PointRuleUpdate, ctx: &TenantCtx) -> AppResult<Option<PointRule>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let result = sqlx::query("UPDATE ptn.point_rules SET base_points = $2, multiplier = $3, enabled = $4 WHERE public_id = $1")
+            .bind(id)
+            .bind(u.base_points)
+            .bind(u.multiplier)
+            .bind(u.enabled)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, PointRuleRow>(&format!("{SELECT_POINT_RULE} WHERE public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(row.into()))
     }
 
-    async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM point_rules WHERE id = $1").bind(id).execute(&self.pool).await?;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let result = sqlx::query("DELETE FROM ptn.point_rules WHERE public_id = $1").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -124,7 +160,7 @@ impl PostgresBadgeRepository {
 
 #[derive(sqlx::FromRow)]
 struct BadgeRow {
-    id: Uuid,
+    public_id: Uuid,
     emoji: String,
     icon_type: String,
     icon_name: Option<String>,
@@ -143,7 +179,7 @@ impl TryFrom<BadgeRow> for Badge {
     type Error = crate::error::AppError;
     fn try_from(r: BadgeRow) -> Result<Self, Self::Error> {
         Ok(Badge {
-            id: r.id,
+            id: r.public_id,
             emoji: r.emoji,
             icon_type: r.icon_type,
             icon_name: r.icon_name,
@@ -163,15 +199,29 @@ impl TryFrom<BadgeRow> for Badge {
     }
 }
 
-const SELECT_BADGE: &str = "SELECT id, emoji, icon_type, icon_name, icon_url, name, description, rarity, condition_type, condition_value, active, created_by, created_at FROM badges";
-const BADGE_COLUMNS: &str = "id, emoji, icon_type, icon_name, icon_url, name, description, rarity, condition_type, condition_value, active, created_by, created_at";
+const SELECT_BADGE: &str = r#"
+    SELECT b.public_id, b.emoji, b.icon_type, b.icon_name, b.icon_url, b.name, b.description, b.rarity,
+           b.condition_type, b.condition_value, b.active,
+           (SELECT public_id FROM core.akun WHERE core.akun.id = b.created_by) AS created_by,
+           b.created_at
+    FROM ptn.badges b
+"#;
 
 #[async_trait]
 impl BadgeRepository for PostgresBadgeRepository {
-    async fn create(&self, n: NewBadge) -> AppResult<Badge> {
-        let row = sqlx::query_as::<_, BadgeRow>(&format!(
-            "INSERT INTO badges (emoji, icon_type, icon_name, icon_url, name, description, rarity, condition_type, condition_value, active, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING {BADGE_COLUMNS}",
-        ))
+    async fn create(&self, n: NewBadge, ctx: &TenantCtx) -> AppResult<Badge> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let created_by_id: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(n.created_by)
+            .fetch_one(&mut *tx)
+            .await?;
+        let public_id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO ptn.badges
+                (tenant_id, emoji, icon_type, icon_name, icon_url, name, description, rarity, condition_type, condition_value, active, created_by)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+               RETURNING public_id"#,
+        )
+        .bind(ctx.tenant_id)
         .bind(&n.emoji)
         .bind(&n.icon_type)
         .bind(&n.icon_name)
@@ -182,28 +232,40 @@ impl BadgeRepository for PostgresBadgeRepository {
         .bind(n.condition_type.as_str())
         .bind(n.condition_value)
         .bind(n.active)
-        .bind(n.created_by)
-        .fetch_one(&self.pool)
+        .bind(created_by_id)
+        .fetch_one(&mut *tx)
         .await?;
+        let row = sqlx::query_as::<_, BadgeRow>(&format!("{SELECT_BADGE} WHERE b.public_id = $1"))
+            .bind(public_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Badge::try_from(row)
     }
 
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Badge>> {
-        let row = sqlx::query_as::<_, BadgeRow>(&format!("{SELECT_BADGE} WHERE id = $1"))
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Badge>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let row = sqlx::query_as::<_, BadgeRow>(&format!("{SELECT_BADGE} WHERE b.public_id = $1"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        tx.commit().await?;
         row.map(Badge::try_from).transpose()
     }
 
-    async fn list(&self) -> AppResult<Vec<Badge>> {
-        let rows = sqlx::query_as::<_, BadgeRow>(&format!("{SELECT_BADGE} ORDER BY created_at DESC")).fetch_all(&self.pool).await?;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<Badge>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let rows = sqlx::query_as::<_, BadgeRow>(&format!("{SELECT_BADGE} ORDER BY b.created_at DESC")).fetch_all(&mut *tx).await?;
+        tx.commit().await?;
         rows.into_iter().map(Badge::try_from).collect()
     }
 
-    async fn update(&self, id: Uuid, u: BadgeUpdate) -> AppResult<Option<Badge>> {
+    async fn update(&self, id: Uuid, u: BadgeUpdate, ctx: &TenantCtx) -> AppResult<Option<Badge>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let result = sqlx::query(
-            "UPDATE badges SET emoji=$2, icon_type=$3, icon_name=$4, icon_url=$5, name=$6, description=$7, rarity=$8, condition_type=$9, condition_value=$10, active=$11 WHERE id=$1",
+            r#"UPDATE ptn.badges SET emoji=$2, icon_type=$3, icon_name=$4, icon_url=$5, name=$6, description=$7,
+                   rarity=$8, condition_type=$9, condition_value=$10, active=$11
+               WHERE public_id=$1"#,
         )
         .bind(id)
         .bind(&u.emoji)
@@ -216,89 +278,112 @@ impl BadgeRepository for PostgresBadgeRepository {
         .bind(u.condition_type.as_str())
         .bind(u.condition_value)
         .bind(u.active)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Ok(None);
         }
-        self.find_by_id(id).await
+        let row = sqlx::query_as::<_, BadgeRow>(&format!("{SELECT_BADGE} WHERE b.public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Badge::try_from(row).map(Some)
     }
 
-    async fn set_active(&self, id: Uuid, active: bool) -> AppResult<Option<Badge>> {
-        let result = sqlx::query("UPDATE badges SET active = $2 WHERE id = $1").bind(id).bind(active).execute(&self.pool).await?;
+    async fn set_active(&self, id: Uuid, active: bool, ctx: &TenantCtx) -> AppResult<Option<Badge>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let result = sqlx::query("UPDATE ptn.badges SET active = $2 WHERE public_id = $1").bind(id).bind(active).execute(&mut *tx).await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Ok(None);
         }
-        self.find_by_id(id).await
+        let row = sqlx::query_as::<_, BadgeRow>(&format!("{SELECT_BADGE} WHERE b.public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Badge::try_from(row).map(Some)
     }
 
-    async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM badges WHERE id = $1").bind(id).execute(&self.pool).await?;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let result = sqlx::query("DELETE FROM ptn.badges WHERE public_id = $1").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
-    async fn earned_count(&self, condition_type: BadgeConditionType, condition_value: i32) -> AppResult<i64> {
+    async fn earned_count(&self, condition_type: BadgeConditionType, condition_value: i32, ctx: &TenantCtx) -> AppResult<i64> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let count: i64 = match condition_type {
             BadgeConditionType::ScoreGte => {
-                sqlx::query_scalar("SELECT COUNT(DISTINCT student_id) FROM attempts WHERE status = 'submitted' AND score >= $1")
+                sqlx::query_scalar("SELECT COUNT(DISTINCT student_id) FROM ptn.attempts WHERE status = 'submitted' AND score >= $1")
                     .bind(condition_value)
-                    .fetch_one(&self.pool)
+                    .fetch_one(&mut *tx)
                     .await?
             }
             BadgeConditionType::QuestionsGte => {
                 sqlx::query_scalar(
                     r#"SELECT COUNT(*) FROM (
                         SELECT a.student_id, COUNT(DISTINCT aa.question_id) AS qcount
-                        FROM attempts a JOIN attempt_answers aa ON aa.attempt_id = a.id
+                        FROM ptn.attempts a JOIN ptn.attempt_answers aa ON aa.attempt_id = a.id
                         WHERE a.status = 'submitted'
                         GROUP BY a.student_id
                     ) t WHERE t.qcount >= $1"#,
                 )
                 .bind(condition_value)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?
             }
             BadgeConditionType::TryoutGte => {
                 sqlx::query_scalar(
                     r#"SELECT COUNT(*) FROM (
-                        SELECT student_id, COUNT(*) AS cnt FROM attempts WHERE status = 'submitted' GROUP BY student_id
+                        SELECT student_id, COUNT(*) AS cnt FROM ptn.attempts WHERE status = 'submitted' GROUP BY student_id
                     ) t WHERE t.cnt >= $1"#,
                 )
                 .bind(condition_value)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?
             }
             BadgeConditionType::RankLte => {
                 sqlx::query_scalar(
                     r#"WITH best AS (
-                        SELECT student_id, MAX(score) AS best_score FROM attempts WHERE status = 'submitted' GROUP BY student_id
+                        SELECT student_id, MAX(score) AS best_score FROM ptn.attempts WHERE status = 'submitted' GROUP BY student_id
                     ), ranked AS (
                         SELECT student_id, RANK() OVER (ORDER BY best_score DESC) AS rnk FROM best
                     )
                     SELECT COUNT(*) FROM ranked WHERE rnk <= $1"#,
                 )
                 .bind(condition_value as i64)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?
             }
-            BadgeConditionType::StreakGte => sqlx::query_scalar(STREAK_COUNT_SQL).bind(condition_value).fetch_one(&self.pool).await?,
+            BadgeConditionType::StreakGte => sqlx::query_scalar(STREAK_COUNT_SQL).bind(condition_value).fetch_one(&mut *tx).await?,
         };
+        tx.commit().await?;
         Ok(count)
     }
 
-    async fn list_with_stats(&self) -> AppResult<Vec<BadgeWithStats>> {
-        let badges = self.list().await?;
+    async fn list_with_stats(&self, ctx: &TenantCtx) -> AppResult<Vec<BadgeWithStats>> {
+        let badges = self.list(ctx).await?;
         let mut out = Vec::with_capacity(badges.len());
         for badge in badges {
-            let earned_by = self.earned_count(badge.condition_type, badge.condition_value).await?;
+            let earned_by = self.earned_count(badge.condition_type, badge.condition_value, ctx).await?;
             out.push(BadgeWithStats { badge, earned_by });
         }
         Ok(out)
     }
 
-    async fn list_for_student(&self, student_id: Uuid) -> AppResult<Vec<StudentBadgeStatus>> {
-        let badges = self.list().await?;
-        let m: StudentMetricsRow = sqlx::query_as(STUDENT_METRICS_SQL).bind(student_id).fetch_one(&self.pool).await?;
+    async fn list_for_student(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<StudentBadgeStatus>> {
+        let badges = self.list(ctx).await?;
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let student_pk: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(student_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let m: StudentMetricsRow = sqlx::query_as(STUDENT_METRICS_SQL).bind(student_pk).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
 
         Ok(badges
             .into_iter()
@@ -322,26 +407,27 @@ struct StudentMetricsRow {
 
 /// One student's raw real metrics, all computed in a single round-trip — used to
 /// evaluate every active badge's condition against that student without N+1 queries.
+/// `$1` is the student's bigint `core.akun.id`, resolved from `public_id` by the caller.
 const STUDENT_METRICS_SQL: &str = r#"
     WITH my AS (
         SELECT COALESCE(MAX(score), 0) AS best_score, COUNT(*) AS tryout_count
-        FROM attempts WHERE student_id = $1 AND status = 'submitted'
+        FROM ptn.attempts WHERE student_id = $1 AND status = 'submitted'
     ), q AS (
         SELECT COUNT(DISTINCT aa.question_id) AS qcount
-        FROM attempts a JOIN attempt_answers aa ON aa.attempt_id = a.id
+        FROM ptn.attempts a JOIN ptn.attempt_answers aa ON aa.attempt_id = a.id
         WHERE a.student_id = $1 AND a.status = 'submitted'
     ), streak AS (
         SELECT COALESCE(MAX(run_len), 0) AS streak FROM (
             SELECT COUNT(*) AS run_len FROM (
                 SELECT d, d - (ROW_NUMBER() OVER (ORDER BY d))::integer AS grp_key FROM (
-                    SELECT DISTINCT submitted_at::date AS d FROM attempts
+                    SELECT DISTINCT submitted_at::date AS d FROM ptn.attempts
                     WHERE student_id = $1 AND status = 'submitted' AND submitted_at IS NOT NULL
                 ) days
             ) grp GROUP BY grp_key
         ) runs
     ), ranked AS (
         SELECT student_id, RANK() OVER (ORDER BY MAX(score) DESC) AS rnk
-        FROM attempts WHERE status = 'submitted' GROUP BY student_id
+        FROM ptn.attempts WHERE status = 'submitted' GROUP BY student_id
     )
     SELECT my.best_score AS best_score, streak.streak AS streak, q.qcount AS questions_answered,
            my.tryout_count AS tryout_count, (SELECT rnk FROM ranked WHERE student_id = $1) AS rank
@@ -376,7 +462,7 @@ fn evaluate_badge(condition_type: BadgeConditionType, condition_value: i32, m: &
 /// onto the same group key.
 const STREAK_COUNT_SQL: &str = r#"
     WITH days AS (
-        SELECT DISTINCT student_id, submitted_at::date AS d FROM attempts WHERE status = 'submitted' AND submitted_at IS NOT NULL
+        SELECT DISTINCT student_id, submitted_at::date AS d FROM ptn.attempts WHERE status = 'submitted' AND submitted_at IS NOT NULL
     ), grp AS (
         SELECT student_id, d, d - (ROW_NUMBER() OVER (PARTITION BY student_id ORDER BY d))::integer AS grp_key
         FROM days
@@ -402,7 +488,7 @@ impl PostgresChallengeRepository {
 
 #[derive(sqlx::FromRow)]
 struct ChallengeRow {
-    id: Uuid,
+    public_id: Uuid,
     name: String,
     challenge_type: String,
     status: String,
@@ -420,7 +506,7 @@ impl TryFrom<ChallengeRow> for Challenge {
     type Error = crate::error::AppError;
     fn try_from(r: ChallengeRow) -> Result<Self, Self::Error> {
         Ok(Challenge {
-            id: r.id,
+            id: r.public_id,
             name: r.name,
             challenge_type: r
                 .challenge_type
@@ -439,18 +525,29 @@ impl TryFrom<ChallengeRow> for Challenge {
     }
 }
 
-const SELECT_CHALLENGE: &str =
-    "SELECT id, name, challenge_type, status, start_date, end_date, target_value, reward_points, reward_badge, description, created_by, created_at FROM challenges";
+const SELECT_CHALLENGE: &str = r#"
+    SELECT c.public_id, c.name, c.challenge_type, c.status, c.start_date, c.end_date, c.target_value,
+           c.reward_points, c.reward_badge, c.description,
+           (SELECT public_id FROM core.akun WHERE core.akun.id = c.created_by) AS created_by,
+           c.created_at
+    FROM ptn.challenges c
+"#;
 
 #[async_trait]
 impl ChallengeRepository for PostgresChallengeRepository {
-    async fn create(&self, n: NewChallenge) -> AppResult<Challenge> {
-        let id = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO challenges (id, name, challenge_type, start_date, end_date, target_value, reward_points, reward_badge, description, created_by)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"#,
+    async fn create(&self, n: NewChallenge, ctx: &TenantCtx) -> AppResult<Challenge> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let created_by_id: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(n.created_by)
+            .fetch_one(&mut *tx)
+            .await?;
+        let public_id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO ptn.challenges
+                (tenant_id, name, challenge_type, start_date, end_date, target_value, reward_points, reward_badge, description, created_by)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+               RETURNING public_id"#,
         )
-        .bind(id)
+        .bind(ctx.tenant_id)
         .bind(&n.name)
         .bind(n.challenge_type.as_str())
         .bind(n.start_date)
@@ -459,25 +556,37 @@ impl ChallengeRepository for PostgresChallengeRepository {
         .bind(n.reward_points)
         .bind(&n.reward_badge)
         .bind(&n.description)
-        .bind(n.created_by)
-        .execute(&self.pool)
+        .bind(created_by_id)
+        .fetch_one(&mut *tx)
         .await?;
-        self.find_by_id(id).await?.ok_or_else(|| crate::error::AppError::Internal(anyhow::anyhow!("challenge vanished right after insert")))
+        let row = sqlx::query_as::<_, ChallengeRow>(&format!("{SELECT_CHALLENGE} WHERE c.public_id = $1"))
+            .bind(public_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Challenge::try_from(row)
     }
 
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Challenge>> {
-        let row = sqlx::query_as::<_, ChallengeRow>(&format!("{SELECT_CHALLENGE} WHERE id = $1")).bind(id).fetch_optional(&self.pool).await?;
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Challenge>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let row = sqlx::query_as::<_, ChallengeRow>(&format!("{SELECT_CHALLENGE} WHERE c.public_id = $1")).bind(id).fetch_optional(&mut *tx).await?;
+        tx.commit().await?;
         row.map(Challenge::try_from).transpose()
     }
 
-    async fn list(&self) -> AppResult<Vec<Challenge>> {
-        let rows = sqlx::query_as::<_, ChallengeRow>(&format!("{SELECT_CHALLENGE} ORDER BY start_date DESC")).fetch_all(&self.pool).await?;
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<Challenge>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let rows = sqlx::query_as::<_, ChallengeRow>(&format!("{SELECT_CHALLENGE} ORDER BY c.start_date DESC")).fetch_all(&mut *tx).await?;
+        tx.commit().await?;
         rows.into_iter().map(Challenge::try_from).collect()
     }
 
-    async fn update(&self, id: Uuid, u: ChallengeUpdate) -> AppResult<Option<Challenge>> {
+    async fn update(&self, id: Uuid, u: ChallengeUpdate, ctx: &TenantCtx) -> AppResult<Option<Challenge>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let result = sqlx::query(
-            "UPDATE challenges SET name=$2, challenge_type=$3, start_date=$4, end_date=$5, target_value=$6, reward_points=$7, reward_badge=$8, description=$9 WHERE id=$1",
+            r#"UPDATE ptn.challenges SET name=$2, challenge_type=$3, start_date=$4, end_date=$5, target_value=$6,
+                   reward_points=$7, reward_badge=$8, description=$9
+               WHERE public_id=$1"#,
         )
         .bind(id)
         .bind(&u.name)
@@ -488,41 +597,58 @@ impl ChallengeRepository for PostgresChallengeRepository {
         .bind(u.reward_points)
         .bind(&u.reward_badge)
         .bind(&u.description)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Ok(None);
         }
-        self.find_by_id(id).await
+        let row = sqlx::query_as::<_, ChallengeRow>(&format!("{SELECT_CHALLENGE} WHERE c.public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Challenge::try_from(row).map(Some)
     }
 
-    async fn set_status(&self, id: Uuid, status: ChallengeStatus) -> AppResult<Option<Challenge>> {
-        let result = sqlx::query("UPDATE challenges SET status = $2 WHERE id = $1").bind(id).bind(status.as_str()).execute(&self.pool).await?;
+    async fn set_status(&self, id: Uuid, status: ChallengeStatus, ctx: &TenantCtx) -> AppResult<Option<Challenge>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let result =
+            sqlx::query("UPDATE ptn.challenges SET status = $2 WHERE public_id = $1").bind(id).bind(status.as_str()).execute(&mut *tx).await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Ok(None);
         }
-        self.find_by_id(id).await
+        let row = sqlx::query_as::<_, ChallengeRow>(&format!("{SELECT_CHALLENGE} WHERE c.public_id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Challenge::try_from(row).map(Some)
     }
 
-    async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM challenges WHERE id = $1").bind(id).execute(&self.pool).await?;
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let result = sqlx::query("DELETE FROM ptn.challenges WHERE public_id = $1").bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
-    async fn stats_for(&self, challenge: &Challenge) -> AppResult<(i64, i64)> {
+    async fn stats_for(&self, challenge: &Challenge, ctx: &TenantCtx) -> AppResult<(i64, i64)> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let participants: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT student_id) FROM attempts WHERE status = 'submitted' AND submitted_at::date BETWEEN $1 AND $2",
+            "SELECT COUNT(DISTINCT student_id) FROM ptn.attempts WHERE status = 'submitted' AND submitted_at::date BETWEEN $1 AND $2",
         )
         .bind(challenge.start_date)
         .bind(challenge.end_date)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
 
         let completions: i64 = match challenge.challenge_type {
             ChallengeType::MostSolved => {
                 sqlx::query_scalar(
                     r#"SELECT COUNT(*) FROM (
-                        SELECT student_id, COUNT(*) AS cnt FROM attempts
+                        SELECT student_id, COUNT(*) AS cnt FROM ptn.attempts
                         WHERE status = 'submitted' AND submitted_at::date BETWEEN $1 AND $2
                         GROUP BY student_id
                     ) t WHERE t.cnt >= $3"#,
@@ -530,13 +656,13 @@ impl ChallengeRepository for PostgresChallengeRepository {
                 .bind(challenge.start_date)
                 .bind(challenge.end_date)
                 .bind(challenge.target_value)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?
             }
             ChallengeType::HighestScore => {
                 sqlx::query_scalar(
                     r#"SELECT COUNT(*) FROM (
-                        SELECT student_id, MAX(score) AS best FROM attempts
+                        SELECT student_id, MAX(score) AS best FROM ptn.attempts
                         WHERE status = 'submitted' AND submitted_at::date BETWEEN $1 AND $2
                         GROUP BY student_id
                     ) t WHERE t.best >= $3"#,
@@ -544,13 +670,13 @@ impl ChallengeRepository for PostgresChallengeRepository {
                 .bind(challenge.start_date)
                 .bind(challenge.end_date)
                 .bind(challenge.target_value)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?
             }
             ChallengeType::Speed => {
                 sqlx::query_scalar(
                     r#"SELECT COUNT(*) FROM (
-                        SELECT student_id, MAX(COALESCE(correct_count, 0) + COALESCE(wrong_count, 0)) AS answered FROM attempts
+                        SELECT student_id, MAX(COALESCE(correct_count, 0) + COALESCE(wrong_count, 0)) AS answered FROM ptn.attempts
                         WHERE status = 'submitted' AND submitted_at::date BETWEEN $1 AND $2
                         GROUP BY student_id
                     ) t WHERE t.answered >= $3"#,
@@ -558,13 +684,13 @@ impl ChallengeRepository for PostgresChallengeRepository {
                 .bind(challenge.start_date)
                 .bind(challenge.end_date)
                 .bind(challenge.target_value)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?
             }
             ChallengeType::LongestStreak => {
                 sqlx::query_scalar(
                     r#"WITH days AS (
-                        SELECT DISTINCT student_id, submitted_at::date AS d FROM attempts
+                        SELECT DISTINCT student_id, submitted_at::date AS d FROM ptn.attempts
                         WHERE status = 'submitted' AND submitted_at::date BETWEEN $1 AND $2
                     ), grp AS (
                         SELECT student_id, d, d - (ROW_NUMBER() OVER (PARTITION BY student_id ORDER BY d))::integer AS grp_key
@@ -579,19 +705,20 @@ impl ChallengeRepository for PostgresChallengeRepository {
                 .bind(challenge.start_date)
                 .bind(challenge.end_date)
                 .bind(challenge.target_value)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?
             }
         };
 
+        tx.commit().await?;
         Ok((participants, completions))
     }
 
-    async fn list_with_stats(&self) -> AppResult<Vec<ChallengeWithStats>> {
-        let challenges = self.list().await?;
+    async fn list_with_stats(&self, ctx: &TenantCtx) -> AppResult<Vec<ChallengeWithStats>> {
+        let challenges = self.list(ctx).await?;
         let mut out = Vec::with_capacity(challenges.len());
         for challenge in challenges {
-            let (participants, completions) = self.stats_for(&challenge).await?;
+            let (participants, completions) = self.stats_for(&challenge, ctx).await?;
             out.push(ChallengeWithStats { challenge, participants, completions });
         }
         Ok(out)
@@ -627,7 +754,7 @@ const STREAK_PER_STUDENT_SQL: &str = r#"
         SELECT student_id, COUNT(*) AS run_len FROM (
             SELECT student_id, d, d - (ROW_NUMBER() OVER (PARTITION BY student_id ORDER BY d))::integer AS grp_key
             FROM (
-                SELECT DISTINCT student_id, submitted_at::date AS d FROM attempts
+                SELECT DISTINCT student_id, submitted_at::date AS d FROM ptn.attempts
                 WHERE status = 'submitted' AND submitted_at IS NOT NULL
             ) days
         ) grp GROUP BY student_id, grp_key
@@ -647,21 +774,22 @@ fn range_binds(range: LeaderboardRange) -> (Option<chrono::NaiveDate>, Option<Da
 
 #[async_trait]
 impl LeaderboardRepository for PostgresLeaderboardRepository {
-    async fn top_students(&self, params: LeaderboardParams) -> AppResult<Vec<LeaderboardEntry>> {
+    async fn top_students(&self, params: LeaderboardParams, ctx: &TenantCtx) -> AppResult<Vec<LeaderboardEntry>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let (today, since) = range_binds(params.range);
         let rows = sqlx::query_as::<_, LeaderboardRow>(&format!(
             r#"WITH streaks AS ({STREAK_PER_STUDENT_SQL})
-               SELECT u.id AS student_id, u.name AS student_name, s.name AS school_name,
-                      MAX(a.score) AS best_score, COALESCE(MAX(st.streak), 0) AS streak
-               FROM attempts a
-               JOIN users u ON u.id = a.student_id
-               LEFT JOIN schools s ON s.id = u.school_id
-               LEFT JOIN streaks st ON st.student_id = u.id
-               WHERE a.status = 'submitted'
-                 AND ($2::uuid IS NULL OR u.school_id = $2)
-                 AND ($3::date IS NULL OR a.submitted_at::date = $3)
-                 AND ($4::timestamptz IS NULL OR a.submitted_at >= $4)
-               GROUP BY u.id, u.name, s.name
+               SELECT a.public_id AS student_id, a.full_name AS student_name, t.name AS school_name,
+                      MAX(att.score) AS best_score, COALESCE(MAX(st.streak), 0) AS streak
+               FROM ptn.attempts att
+               JOIN core.akun a ON a.id = att.student_id
+               LEFT JOIN core.tenant t ON t.id = a.tenant_id AND a.tenant_id <> 0
+               LEFT JOIN streaks st ON st.student_id = att.student_id
+               WHERE att.status = 'submitted'
+                 AND ($2::uuid IS NULL OR a.tenant_id = (SELECT id FROM core.tenant WHERE public_id = $2))
+                 AND ($3::date IS NULL OR att.submitted_at::date = $3)
+                 AND ($4::timestamptz IS NULL OR att.submitted_at >= $4)
+               GROUP BY a.public_id, a.full_name, t.name
                ORDER BY best_score DESC
                LIMIT $1"#
         ))
@@ -669,36 +797,38 @@ impl LeaderboardRepository for PostgresLeaderboardRepository {
         .bind(params.school_id)
         .bind(today)
         .bind(since)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(into_ranked_entries(rows))
     }
 
-    async fn top_students_by_subject(&self, params: LeaderboardParams, subject: &str) -> AppResult<Vec<LeaderboardEntry>> {
+    async fn top_students_by_subject(&self, params: LeaderboardParams, subject: &str, ctx: &TenantCtx) -> AppResult<Vec<LeaderboardEntry>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
         let (today, since) = range_binds(params.range);
         let rows = sqlx::query_as::<_, LeaderboardRow>(&format!(
             r#"WITH streaks AS ({STREAK_PER_STUDENT_SQL}),
                acc AS (
-                   SELECT a.student_id,
+                   SELECT att.student_id,
                           ROUND(COUNT(*) FILTER (WHERE aa.is_correct = true)::numeric / NULLIF(COUNT(*), 0) * 100)::int AS accuracy
-                   FROM attempt_answers aa
-                   JOIN questions q ON q.id = aa.question_id
-                   JOIN attempts a ON a.id = aa.attempt_id
+                   FROM ptn.attempt_answers aa
+                   JOIN ptn.questions q ON q.id = aa.question_id
+                   JOIN ptn.attempts att ON att.id = aa.attempt_id
                    WHERE aa.is_correct IS NOT NULL
                      AND q.subject = $5
-                     AND a.status = 'submitted'
-                     AND ($3::date IS NULL OR a.submitted_at::date = $3)
-                     AND ($4::timestamptz IS NULL OR a.submitted_at >= $4)
-                   GROUP BY a.student_id
+                     AND att.status = 'submitted'
+                     AND ($3::date IS NULL OR att.submitted_at::date = $3)
+                     AND ($4::timestamptz IS NULL OR att.submitted_at >= $4)
+                   GROUP BY att.student_id
                )
-               SELECT u.id AS student_id, u.name AS student_name, s.name AS school_name,
+               SELECT a.public_id AS student_id, a.full_name AS student_name, t.name AS school_name,
                       COALESCE(acc.accuracy, 0) AS best_score, COALESCE(st.streak, 0) AS streak
                FROM acc
-               JOIN users u ON u.id = acc.student_id
-               LEFT JOIN schools s ON s.id = u.school_id
-               LEFT JOIN streaks st ON st.student_id = u.id
-               WHERE ($2::uuid IS NULL OR u.school_id = $2)
+               JOIN core.akun a ON a.id = acc.student_id
+               LEFT JOIN core.tenant t ON t.id = a.tenant_id AND a.tenant_id <> 0
+               LEFT JOIN streaks st ON st.student_id = acc.student_id
+               WHERE ($2::uuid IS NULL OR a.tenant_id = (SELECT id FROM core.tenant WHERE public_id = $2))
                ORDER BY best_score DESC
                LIMIT $1"#
         ))
@@ -707,8 +837,9 @@ impl LeaderboardRepository for PostgresLeaderboardRepository {
         .bind(today)
         .bind(since)
         .bind(subject)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(into_ranked_entries(rows))
     }

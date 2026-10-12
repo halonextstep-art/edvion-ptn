@@ -9,6 +9,7 @@ use crate::domain::analytics::{
     SubjectAccuracy, YearlyPerformancePoint,
 };
 use crate::domain::repository::{AnalyticsRepository, UserRepository};
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
 use crate::interfaces::http::middleware::AuthUser;
@@ -26,7 +27,7 @@ impl AnalyticsService {
     async fn resolve_own_school_id(&self, actor: &AuthUser) -> AppResult<uuid::Uuid> {
         let me = self
             .users
-            .find_by_id(actor.user_id)
+            .find_by_id(actor.user_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Unauthorized("akun tidak ditemukan".to_string()))?;
         me.school_id
@@ -38,14 +39,14 @@ impl AnalyticsService {
     pub async fn subject_breakdown_for_school(&self, actor: &AuthUser) -> AppResult<Vec<SubjectAccuracy>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.analytics.subject_breakdown_for_school(school_id).await
+        self.analytics.subject_breakdown_for_school(school_id, &actor.tenant).await
     }
 
     /// School portal's own score trend (used by the Laporan "Performa Siswa" report).
     pub async fn score_trend_for_school(&self, actor: &AuthUser, days: i32) -> AppResult<Vec<ScoreTrendPoint>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.analytics.score_trend_for_school(school_id, days.clamp(1, 365)).await
+        self.analytics.score_trend_for_school(school_id, days.clamp(1, 365), &actor.tenant).await
     }
 
     /// School portal's "Perbandingan Tahun" — attempts bucketed by the calendar year of
@@ -58,14 +59,14 @@ impl AnalyticsService {
     pub async fn score_trend_by_year_for_school(&self, actor: &AuthUser) -> AppResult<Vec<YearlyPerformancePoint>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.analytics.score_trend_by_year_for_school(school_id).await
+        self.analytics.score_trend_by_year_for_school(school_id, &actor.tenant).await
     }
 
     /// School portal's internal student ranking (Rekap SNBT / Laporan "Ranking Internal").
     pub async fn student_ranking_for_school(&self, actor: &AuthUser) -> AppResult<Vec<StudentRanking>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.analytics.student_ranking_for_school(school_id).await
+        self.analytics.student_ranking_for_school(school_id, &actor.tenant).await
     }
 
     /// School portal's "Analytics & Insights" student drill-down (Ringkasan per Kelas +
@@ -73,14 +74,14 @@ impl AnalyticsService {
     pub async fn student_activity_for_school(&self, actor: &AuthUser) -> AppResult<Vec<StudentActivity>> {
         actor.require_role(&[Role::School])?;
         let school_id = self.resolve_own_school_id(actor).await?;
-        self.analytics.student_activity_for_school(school_id).await
+        self.analytics.student_activity_for_school(school_id, &actor.tenant).await
     }
 
     /// Student portal's own Overview mastery breakdown — scoped to the acting student's
     /// own real answers only.
     pub async fn my_subject_breakdown(&self, actor: &AuthUser) -> AppResult<Vec<SubjectAccuracy>> {
         actor.require_role(&[Role::Student])?;
-        self.analytics.subject_breakdown_for_student(actor.user_id).await
+        self.analytics.subject_breakdown_for_student(actor.user_id, &actor.tenant).await
     }
 
     /// Platform-wide average score trend, exposed to any authenticated role — used by the
@@ -89,41 +90,41 @@ impl AnalyticsService {
     /// so unlike `score_trend` this isn't admin-only. Same underlying real query.
     pub async fn national_score_trend(&self, actor: &AuthUser, days: i32) -> AppResult<Vec<ScoreTrendPoint>> {
         actor.require_role(&[Role::Admin, Role::Student, Role::School])?;
-        self.analytics.score_trend(days.clamp(1, 365)).await
+        self.analytics.score_trend(days.clamp(1, 365), &TenantCtx::platform_admin()).await
     }
 
     pub async fn summary(&self, actor: &AuthUser) -> AppResult<AnalyticsSummary> {
         actor.require_role(&[Role::Admin])?;
-        self.analytics.summary().await
+        self.analytics.summary(&TenantCtx::platform_admin()).await
     }
 
     /// No-auth read for the public marketing landing page — same real system-wide
     /// aggregate query as `summary()`, just without the Admin gate. Lets the landing page
     /// show real platform numbers instead of hardcoded marketing figures.
     pub async fn public_summary(&self) -> AppResult<AnalyticsSummary> {
-        self.analytics.summary().await
+        self.analytics.summary(&TenantCtx::platform_admin()).await
     }
 
     pub async fn score_trend(&self, actor: &AuthUser, days: i32) -> AppResult<Vec<ScoreTrendPoint>> {
         actor.require_role(&[Role::Admin])?;
         let days = days.clamp(1, 365);
-        self.analytics.score_trend(days).await
+        self.analytics.score_trend(days, &TenantCtx::platform_admin()).await
     }
 
     pub async fn subject_breakdown(&self, actor: &AuthUser) -> AppResult<Vec<SubjectAccuracy>> {
         actor.require_role(&[Role::Admin])?;
-        self.analytics.subject_breakdown().await
+        self.analytics.subject_breakdown(&TenantCtx::platform_admin()).await
     }
 
     pub async fn question_status_distribution(&self, actor: &AuthUser) -> AppResult<Vec<QuestionStatusCount>> {
         actor.require_role(&[Role::Admin])?;
-        self.analytics.question_status_distribution().await
+        self.analytics.question_status_distribution(&TenantCtx::platform_admin()).await
     }
 
     pub async fn top_schools(&self, actor: &AuthUser, limit: i64) -> AppResult<Vec<SchoolRanking>> {
         actor.require_role(&[Role::Admin])?;
         let limit = limit.clamp(1, 50);
-        self.analytics.top_schools(limit).await
+        self.analytics.top_schools(limit, &TenantCtx::platform_admin()).await
     }
 
     /// Admin's platform-wide "Perbandingan Tahun" — same year-bucketing as
@@ -131,6 +132,6 @@ impl AnalyticsService {
     /// "tahun" means calendar year of `submitted_at`, not student angkatan/cohort.
     pub async fn score_trend_by_year(&self, actor: &AuthUser) -> AppResult<Vec<YearlyPerformancePoint>> {
         actor.require_role(&[Role::Admin])?;
-        self.analytics.score_trend_by_year().await
+        self.analytics.score_trend_by_year(&TenantCtx::platform_admin()).await
     }
 }

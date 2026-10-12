@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::domain::admission_deadline::{AdmissionDeadline, AdmissionTrack};
 use crate::domain::repository::{AdmissionDeadlineRepository, AdmissionDeadlineUpdate, NewAdmissionDeadline};
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
 use crate::interfaces::http::middleware::AuthUser;
@@ -49,14 +50,14 @@ impl AdmissionDeadlineService {
                 description: input.description,
                 deadline_date: input.deadline_date,
                 created_by: actor.user_id,
-            })
+            }, &TenantCtx::platform_admin())
             .await
     }
 
     /// Full admin CRUD list — includes past deadlines too, for record-keeping.
     pub async fn list(&self, actor: &AuthUser) -> AppResult<Vec<AdmissionDeadline>> {
         actor.require_role(&[Role::Admin])?;
-        self.deadlines.list().await
+        self.deadlines.list(&TenantCtx::platform_admin()).await
     }
 
     /// School/Student/Admin "Deadline Mendatang" widget — only deadlines that haven't
@@ -65,7 +66,7 @@ impl AdmissionDeadlineService {
     pub async fn list_upcoming(&self, actor: &AuthUser, limit: i64) -> AppResult<Vec<AdmissionDeadline>> {
         actor.require_role(&[Role::Admin, Role::School, Role::Student])?;
         let today = Utc::now().date_naive();
-        let mut deadlines = self.deadlines.list().await?;
+        let mut deadlines = self.deadlines.list(&TenantCtx::platform_admin()).await?;
         deadlines.retain(|d| d.deadline_date >= today);
         deadlines.sort_by_key(|d| d.deadline_date);
         deadlines.truncate(limit.clamp(1, 50) as usize);
@@ -75,7 +76,7 @@ impl AdmissionDeadlineService {
     pub async fn get(&self, actor: &AuthUser, id: Uuid) -> AppResult<AdmissionDeadline> {
         actor.require_role(&[Role::Admin])?;
         self.deadlines
-            .find_by_id(id)
+            .find_by_id(id, &TenantCtx::platform_admin())
             .await?
             .ok_or_else(|| AppError::NotFound(format!("admission deadline {id} not found")))
     }
@@ -98,6 +99,7 @@ impl AdmissionDeadlineService {
                     description: input.description,
                     deadline_date: input.deadline_date,
                 },
+                &TenantCtx::platform_admin(),
             )
             .await?
             .ok_or_else(|| AppError::NotFound(format!("admission deadline {id} not found")))
@@ -105,7 +107,7 @@ impl AdmissionDeadlineService {
 
     pub async fn delete(&self, actor: &AuthUser, id: Uuid) -> AppResult<()> {
         actor.require_role(&[Role::Admin])?;
-        let deleted = self.deadlines.delete(id).await?;
+        let deleted = self.deadlines.delete(id, &TenantCtx::platform_admin()).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("admission deadline {id} not found")));
         }

@@ -34,6 +34,7 @@ use crate::domain::repository::{
     SimulationTemplateRepository, TryoutSessionRepository, UserFilter, UserRepository,
 };
 use crate::domain::school::SchoolType;
+use crate::domain::tenant::TenantCtx;
 use crate::domain::tryout::{AttemptStatus, TryoutSession};
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
@@ -116,16 +117,16 @@ impl SchoolTkaService {
         let school_id = self.resolve_own_school_id(actor).await?;
         let students = self
             .users
-            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() })
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
             .await?;
 
-        let all_packages = self.packages.list().await?;
+        let all_packages = self.packages.list(&actor.tenant).await?;
         let mut groups = Vec::new();
         for pkg in all_packages {
             if pkg.exam_track != ExamTrack::Tka {
                 continue;
             }
-            let pkg_sessions = self.package_sessions(pkg.id).await?;
+            let pkg_sessions = self.package_sessions(pkg.id, &actor.tenant).await?;
             if pkg_sessions.is_empty() {
                 continue; // e.g. still a draft in the wizard — nothing real to report yet
             }
@@ -136,8 +137,8 @@ impl SchoolTkaService {
 
             let mut student_rows = Vec::with_capacity(students.len());
             for student in &students {
-                let choices = self.package_elective.list_choices(student.id, pkg.id).await?;
-                let student_attempts = self.attempts.list_by_student(student.id).await?;
+                let choices = self.package_elective.list_choices(student.id, pkg.id, &actor.tenant).await?;
+                let student_attempts = self.attempts.list_by_student(student.id, &actor.tenant).await?;
                 let mut subjects = Vec::with_capacity(pkg_sessions.len());
                 for s in &pkg_sessions {
                     let latest = student_attempts
@@ -181,21 +182,21 @@ impl SchoolTkaService {
     /// Every non-draft session belonging to this package — unioned from directly-attached
     /// `TryoutSession` content items AND from any attached `SimulationTemplate`'s own slots
     /// (deduped by session id). See module doc comment for why both sources are needed.
-    async fn package_sessions(&self, package_id: Uuid) -> AppResult<Vec<TryoutSession>> {
-        let content_items = self.package_content.list_for_package(package_id).await?;
+    async fn package_sessions(&self, package_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<TryoutSession>> {
+        let content_items = self.package_content.list_for_package(package_id, ctx).await?;
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for item in &content_items {
             match item.content_type {
                 PackageContentType::TryoutSession => {
-                    if let Some(s) = self.sessions.find_by_id(item.content_id).await? {
+                    if let Some(s) = self.sessions.find_by_id(item.content_id, ctx).await? {
                         if !s.is_draft && seen.insert(s.id) {
                             out.push(s);
                         }
                     }
                 }
                 PackageContentType::SimulationTemplate => {
-                    let Some(tpl) = self.simulation_templates.find_by_id(item.content_id).await? else { continue };
+                    let Some(tpl) = self.simulation_templates.find_by_id(item.content_id, ctx).await? else { continue };
                     for slot in &tpl.slots {
                         // `None` for `is_elective` slots — no single fixed session to resolve
                         // (see `domain::simulation::SimulationTemplateSlot` doc comment); those
@@ -204,7 +205,7 @@ impl SchoolTkaService {
                         if seen.contains(&session_id) {
                             continue;
                         }
-                        if let Some(s) = self.sessions.find_by_id(session_id).await? {
+                        if let Some(s) = self.sessions.find_by_id(session_id, ctx).await? {
                             if !s.is_draft && seen.insert(s.id) {
                                 out.push(s);
                             }
@@ -219,7 +220,7 @@ impl SchoolTkaService {
     async fn resolve_own_school_id(&self, actor: &AuthUser) -> AppResult<Uuid> {
         let me = self
             .users
-            .find_by_id(actor.user_id)
+            .find_by_id(actor.user_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Unauthorized("akun tidak ditemukan".to_string()))?;
         me.school_id

@@ -35,6 +35,35 @@ impl Role {
     pub fn can_review_questions(&self) -> bool {
         matches!(self, Role::Admin)
     }
+
+    /// `core.role.kode` this `Role` maps to — `core.role` is a shared lookup table across
+    /// every module in this database, so PTN reuses the ADMIN/SISWA rows other modules
+    /// already seed, and owns SEKOLAH/KONTEN itself (see
+    /// migration 20260101000001_core_extensions.sql).
+    pub fn core_role_kode(&self) -> &'static str {
+        match self {
+            Role::Admin => "ADMIN",
+            Role::School => "SEKOLAH",
+            Role::Student => "SISWA",
+            Role::Content => "KONTEN",
+        }
+    }
+
+    pub fn from_core_role_kode(kode: &str) -> Result<Self, String> {
+        match kode {
+            "ADMIN" => Ok(Role::Admin),
+            "SEKOLAH" => Ok(Role::School),
+            "SISWA" => Ok(Role::Student),
+            "KONTEN" => Ok(Role::Content),
+            other => Err(format!("core.role kode '{other}' has no PTN Role mapping")),
+        }
+    }
+
+    /// Admin and content accounts are central (not tied to one school) — they're stored in
+    /// `core.akun` under the reserved platform tenant with `is_platform_admin = true`.
+    pub fn is_platform_scoped(&self) -> bool {
+        matches!(self, Role::Admin | Role::Content)
+    }
 }
 
 impl std::str::FromStr for Role {

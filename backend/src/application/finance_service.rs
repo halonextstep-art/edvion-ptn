@@ -27,9 +27,9 @@ impl FinanceService {
 
     pub async fn summary(&self, actor: &AuthUser) -> AppResult<FinanceSummary> {
         actor.require_role(&[Role::Admin])?;
-        let events = self.events.list().await?;
+        let events = self.events.list(&actor.tenant).await?;
         let schools = self.schools.list().await?;
-        let packages = self.packages.list().await?;
+        let packages = self.packages.list(&actor.tenant).await?;
 
         let paid_events: Vec<_> = events.iter().filter(|e| e.price > 0).collect();
         let total_event_revenue_estimate: i64 = paid_events.iter().map(|e| e.price as i64 * e.participants).sum();
@@ -60,7 +60,7 @@ impl FinanceService {
 
     pub async fn event_breakdown(&self, actor: &AuthUser) -> AppResult<Vec<EventRevenueBreakdown>> {
         actor.require_role(&[Role::Admin])?;
-        let mut events = self.events.list().await?;
+        let mut events = self.events.list(&actor.tenant).await?;
         events.sort_by(|a, b| (b.price as i64 * b.participants).cmp(&(a.price as i64 * a.participants)));
         Ok(events
             .into_iter()

@@ -79,7 +79,7 @@ impl UserService {
         // the B2B/B2C toggle only makes sense for an Admin actor browsing the full roster.
         let has_school = if actor.role == Role::School { None } else { filter.has_school };
         self.users
-            .list(UserFilter { role, status: filter.status, search: filter.search, school_id, has_school })
+            .list(UserFilter { role, status: filter.status, search: filter.search, school_id, has_school }, &actor.tenant)
             .await
     }
 
@@ -123,7 +123,7 @@ impl UserService {
         actor.require_role(&[Role::Admin, Role::School])?;
         if actor.role == Role::School {
             let school_id = self.resolve_own_school_id(actor).await?;
-            self.ensure_owns_student(school_id, id).await?;
+            self.ensure_owns_student(actor, school_id, id).await?;
             input.role = Role::Student;
             input.school_id = Some(school_id);
         }
@@ -139,7 +139,7 @@ impl UserService {
         // the current value so this admin-facing update path can't accidentally null it out.
         let current = self
             .users
-            .find_by_id(id)
+            .find_by_id(id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("user {id} not found")))?;
 
@@ -168,6 +168,7 @@ impl UserService {
                     minat_jurusan: current.minat_jurusan,
                     password_hash,
                 },
+                &actor.tenant,
             )
             .await?
             .ok_or_else(|| AppError::NotFound(format!("user {id} not found")))
@@ -180,7 +181,7 @@ impl UserService {
         if actor.user_id == id {
             return Err(AppError::Validation("you cannot delete your own account".to_string()));
         }
-        let deleted = self.users.delete(id).await?;
+        let deleted = self.users.delete(id, &actor.tenant).await?;
         if !deleted {
             return Err(AppError::NotFound(format!("user {id} not found")));
         }
@@ -193,13 +194,13 @@ impl UserService {
         actor.require_role(&[Role::Admin, Role::School])?;
         if actor.role == Role::School {
             let school_id = self.resolve_own_school_id(actor).await?;
-            self.ensure_owns_student(school_id, id).await?;
+            self.ensure_owns_student(actor, school_id, id).await?;
         }
         if actor.user_id == id && status != UserStatus::Active {
             return Err(AppError::Validation("you cannot deactivate your own account".to_string()));
         }
         self.users
-            .set_status(id, status)
+            .set_status(id, status, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("user {id} not found")))
     }
@@ -208,23 +209,23 @@ impl UserService {
     /// user's name/email (e.g. the manual purchase-request queue showing who the buyer is).
     pub async fn get(&self, actor: &AuthUser, id: Uuid) -> AppResult<User> {
         actor.require_role(&[Role::Admin])?;
-        self.users.find_by_id(id).await?.ok_or_else(|| AppError::NotFound(format!("user {id} not found")))
+        self.users.find_by_id(id, &actor.tenant).await?.ok_or_else(|| AppError::NotFound(format!("user {id} not found")))
     }
 
     async fn resolve_own_school_id(&self, actor: &AuthUser) -> AppResult<Uuid> {
         let me = self
             .users
-            .find_by_id(actor.user_id)
+            .find_by_id(actor.user_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::Unauthorized("akun tidak ditemukan".to_string()))?;
         me.school_id
             .ok_or_else(|| AppError::Validation("akun sekolah ini belum terhubung ke data sekolah".to_string()))
     }
 
-    async fn ensure_owns_student(&self, school_id: Uuid, student_id: Uuid) -> AppResult<()> {
+    async fn ensure_owns_student(&self, actor: &AuthUser, school_id: Uuid, student_id: Uuid) -> AppResult<()> {
         let student = self
             .users
-            .find_by_id(student_id)
+            .find_by_id(student_id, &actor.tenant)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("user {student_id} not found")))?;
         if student.role != Role::Student || student.school_id != Some(school_id) {

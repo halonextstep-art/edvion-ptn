@@ -16,7 +16,8 @@ const brandFeatures = [
   { icon: Layers, label: 'Tim Konten Internal', sub: 'Manajemen paket soal', from: 'from-emerald-400', to: 'to-teal-400' },
 ]
 
-const email = ref('')
+const username = ref('')
+const tenantSlug = ref('')
 const password = ref('')
 const showPassword = ref(false)
 const error = ref('')
@@ -34,11 +35,11 @@ function roleRedirect(role: Role) {
   return '/sekolah'
 }
 
-async function doLogin(useEmail: string, usePassword: string) {
+async function doLogin(useUsername: string, usePassword: string, useTenantSlug: string) {
   error.value = ''
   loading.value = true
   try {
-    const user = await login({ email: useEmail, password: usePassword })
+    const user = await login({ username: useUsername, password: usePassword, tenant_slug: useTenantSlug || null })
     toast.success(`Selamat datang, ${user.name}!`)
 
     // "Beli Paket" on the landing page redirects here with ?intent=purchase&packageId=...
@@ -54,14 +55,14 @@ async function doLogin(useEmail: string, usePassword: string) {
 
     await router.push(roleRedirect(user.role))
   } catch (e: any) {
-    error.value = e?.message || 'Email atau password salah!'
+    error.value = e?.message || 'Username/email atau password salah!'
   } finally {
     loading.value = false
   }
 }
 
 function handleSubmit() {
-  doLogin(email.value, password.value)
+  doLogin(username.value, password.value, tenantSlug.value)
 }
 
 // Forward a pending "Beli Paket" intent through to the B2C registration page too, so a
@@ -141,10 +142,20 @@ const registerLink = computed(() => {
 
           <form class="space-y-4" @submit.prevent="handleSubmit">
             <div>
-              <Label for="email">Email</Label>
+              <Label for="username">Email / Username</Label>
               <div class="relative mt-1.5">
                 <Mail class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-                <Input id="email" v-model="email" type="email" placeholder="nama@email.com" required class="pl-10" />
+                <Input id="username" v-model="username" type="text" placeholder="nama@email.com atau username" required class="pl-10" />
+              </div>
+            </div>
+            <!-- Hanya relevan untuk akun lama lintas-modul (username, bukan email) yang
+                 usernamenya dipakai di lebih dari satu sekolah — lihat backend
+                 AuthService::find_lookup_row_by_username. Akun PTN sendiri (daftar via
+                 /daftar) selalu login dengan email saja, field ini boleh dikosongkan. -->
+            <div>
+              <Label for="tenant-slug">Kode Sekolah <span class="text-muted-foreground font-normal">(opsional, isi jika login dgn username)</span></Label>
+              <div class="relative mt-1.5">
+                <Input id="tenant-slug" v-model="tenantSlug" type="text" placeholder="contoh: sman1-jakarta" class="pl-3" />
               </div>
             </div>
             <div>

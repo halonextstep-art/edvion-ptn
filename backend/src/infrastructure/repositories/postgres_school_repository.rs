@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::domain::repository::{NewSchool, SchoolRepository, SchoolUpdate};
-use crate::domain::school::School;
+use crate::domain::school::{School, SchoolStatus};
 use crate::error::{AppError, AppResult};
 
 pub struct PostgresSchoolRepository {
@@ -19,7 +19,7 @@ impl PostgresSchoolRepository {
 
 #[derive(sqlx::FromRow)]
 struct SchoolRow {
-    id: Uuid,
+    public_id: Uuid,
     name: String,
     school_type: String,
     city: String,
@@ -39,7 +39,7 @@ impl TryFrom<SchoolRow> for School {
     type Error = AppError;
     fn try_from(r: SchoolRow) -> Result<Self, Self::Error> {
         Ok(School {
-            id: r.id,
+            id: r.public_id,
             name: r.name,
             school_type: r
                 .school_type
@@ -66,26 +66,39 @@ impl TryFrom<SchoolRow> for School {
     }
 }
 
+// `School` = `core.tenant` (name/slug, shared with other modules) 1:1-joined with
+// `ptn.school_profile` (PTN-only business columns). Neither table carries RLS (`core.tenant`
+// has no policy at all; `school_profile` is keyed 1:1 by `tenant_id`, its own PK, so there's
+// nothing to scope) — this repository is always admin-facing (see callers in
+// `school_service.rs`/`finance_service.rs`), never called with a per-tenant `TenantCtx`.
 const SELECT_SCHOOL: &str = r#"
-    SELECT id, name, school_type, city, province, email, phone, join_date,
-           package_type, contact_person, status, revenue_share, monthly_revenue, created_at
-    FROM schools
+    SELECT t.public_id, t.name, sp.school_type, sp.city, sp.province, sp.email, sp.phone,
+           sp.join_date, sp.package_type, sp.contact_person, sp.status, sp.revenue_share,
+           sp.monthly_revenue, sp.created_at
+    FROM core.tenant t
+    JOIN ptn.school_profile sp ON sp.tenant_id = t.id
 "#;
 
 #[async_trait]
 impl SchoolRepository for PostgresSchoolRepository {
     async fn create(&self, n: NewSchool) -> AppResult<School> {
-        let id = Uuid::new_v4();
-        let row = sqlx::query_as::<_, SchoolRow>(
-            r#"INSERT INTO schools
-                (id, name, school_type, city, province, email, phone, package_type, contact_person,
-                 status, revenue_share, monthly_revenue)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-               RETURNING id, name, school_type, city, province, email, phone, join_date,
-                         package_type, contact_person, status, revenue_share, monthly_revenue, created_at"#,
+        let mut tx = self.pool.begin().await?;
+
+        let tenant_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO core.tenant (name, slug) VALUES ($1, $2) RETURNING id"#,
         )
-        .bind(id)
         .bind(&n.name)
+        .bind(slugify(&n.name))
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"INSERT INTO ptn.school_profile
+                (tenant_id, school_type, city, province, email, phone, package_type, contact_person,
+                 status, revenue_share, monthly_revenue)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)"#,
+        )
+        .bind(tenant_id)
         .bind(n.school_type.as_str())
         .bind(&n.city)
         .bind(&n.province)
@@ -96,13 +109,19 @@ impl SchoolRepository for PostgresSchoolRepository {
         .bind(n.status.as_str())
         .bind(n.revenue_share)
         .bind(n.monthly_revenue)
-        .fetch_one(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        let row = sqlx::query_as::<_, SchoolRow>(&format!("{SELECT_SCHOOL} WHERE t.id = $1"))
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
         School::try_from(row)
     }
 
     async fn find_by_id(&self, id: Uuid) -> AppResult<Option<School>> {
-        let row = sqlx::query_as::<_, SchoolRow>(&format!("{SELECT_SCHOOL} WHERE id = $1"))
+        let row = sqlx::query_as::<_, SchoolRow>(&format!("{SELECT_SCHOOL} WHERE t.public_id = $1"))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -110,24 +129,38 @@ impl SchoolRepository for PostgresSchoolRepository {
     }
 
     async fn list(&self) -> AppResult<Vec<School>> {
-        let rows = sqlx::query_as::<_, SchoolRow>(&format!("{SELECT_SCHOOL} ORDER BY created_at DESC"))
+        let rows = sqlx::query_as::<_, SchoolRow>(&format!("{SELECT_SCHOOL} ORDER BY sp.created_at DESC"))
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(School::try_from).collect()
     }
 
     async fn update(&self, id: Uuid, u: SchoolUpdate) -> AppResult<Option<School>> {
-        let row = sqlx::query_as::<_, SchoolRow>(
-            r#"UPDATE schools SET
-                name = $2, school_type = $3, city = $4, province = $5, email = $6,
-                phone = $7, package_type = $8, contact_person = $9, status = $10,
-                revenue_share = $11, monthly_revenue = $12
-               WHERE id = $1
-               RETURNING id, name, school_type, city, province, email, phone, join_date,
-                         package_type, contact_person, status, revenue_share, monthly_revenue, created_at"#,
+        let mut tx = self.pool.begin().await?;
+
+        let tenant_id: Option<i64> = sqlx::query_scalar("SELECT id FROM core.tenant WHERE public_id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(tenant_id) = tenant_id else {
+            tx.rollback().await.ok();
+            return Ok(None);
+        };
+
+        sqlx::query("UPDATE core.tenant SET name = $2 WHERE id = $1")
+            .bind(tenant_id)
+            .bind(&u.name)
+            .execute(&mut *tx)
+            .await?;
+
+        let updated = sqlx::query(
+            r#"UPDATE ptn.school_profile SET
+                school_type = $2, city = $3, province = $4, email = $5,
+                phone = $6, package_type = $7, contact_person = $8, status = $9,
+                revenue_share = $10, monthly_revenue = $11
+               WHERE tenant_id = $1"#,
         )
-        .bind(id)
-        .bind(&u.name)
+        .bind(tenant_id)
         .bind(u.school_type.as_str())
         .bind(&u.city)
         .bind(&u.province)
@@ -138,13 +171,23 @@ impl SchoolRepository for PostgresSchoolRepository {
         .bind(u.status.as_str())
         .bind(u.revenue_share)
         .bind(u.monthly_revenue)
-        .fetch_optional(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        row.map(School::try_from).transpose()
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
+
+        let row = sqlx::query_as::<_, SchoolRow>(&format!("{SELECT_SCHOOL} WHERE t.id = $1"))
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        School::try_from(row).map(Some)
     }
 
     async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM schools WHERE id = $1")
+        let result = sqlx::query("DELETE FROM core.tenant WHERE public_id = $1")
             .bind(id)
             .execute(&self.pool)
             .await
@@ -152,15 +195,35 @@ impl SchoolRepository for PostgresSchoolRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn set_status(&self, id: Uuid, status: crate::domain::school::SchoolStatus) -> AppResult<Option<School>> {
-        let result = sqlx::query("UPDATE schools SET status = $2 WHERE id = $1")
-            .bind(id)
-            .bind(status.as_str())
-            .execute(&self.pool)
-            .await?;
+    async fn set_status(&self, id: Uuid, status: SchoolStatus) -> AppResult<Option<School>> {
+        let result = sqlx::query(
+            r#"UPDATE ptn.school_profile SET status = $2
+               WHERE tenant_id = (SELECT id FROM core.tenant WHERE public_id = $1)"#,
+        )
+        .bind(id)
+        .bind(status.as_str())
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Ok(None);
         }
         self.find_by_id(id).await
     }
+}
+
+/// Lowercase/hyphenate the school name into a `core.tenant.slug` candidate, suffixed with a
+/// short random disambiguator (slugs are globally unique across every module's tenants, and
+/// school names routinely collide — "SMA Negeri 1").
+fn slugify(name: &str) -> String {
+    let base: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let suffix: String = Uuid::new_v4().to_string().chars().take(8).collect();
+    format!("{base}-{suffix}")
 }

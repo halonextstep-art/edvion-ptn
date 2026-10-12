@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::domain::package::{ExamTrack, Package};
 use crate::domain::repository::{NewPackage, PackageRepository, PackageUpdate};
+use crate::domain::tenant::TenantCtx;
 use crate::error::{AppError, AppResult};
 
 pub struct PostgresPackageRepository {
@@ -14,6 +15,19 @@ pub struct PostgresPackageRepository {
 impl PostgresPackageRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// See `postgres_user_repository.rs::begin_tx` doc comment.
+    async fn begin_tx(&self, ctx: &TenantCtx) -> AppResult<Transaction<'static, Postgres>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT set_config('app.tenant_id', $1, true), set_config('app.is_platform_admin', $2, true)",
+        )
+        .bind(ctx.tenant_id.to_string())
+        .bind(if ctx.is_platform_admin { "true" } else { "false" })
+        .execute(&mut *tx)
+        .await?;
+        Ok(tx)
     }
 }
 
@@ -34,7 +48,7 @@ fn parse_exam_track(s: &str) -> AppResult<ExamTrack> {
 
 #[derive(sqlx::FromRow)]
 struct PackageRow {
-    id: Uuid,
+    public_id: Uuid,
     name: String,
     package_type: String,
     original_price: i32,
@@ -51,7 +65,7 @@ struct PackageRow {
     accent_color: String,
     active: bool,
     sort_order: i32,
-    created_by: Uuid,
+    created_by_public_id: Uuid,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     elective_pick_count: i32,
@@ -62,7 +76,7 @@ impl TryFrom<PackageRow> for Package {
     type Error = AppError;
     fn try_from(r: PackageRow) -> Result<Self, Self::Error> {
         Ok(Package {
-            id: r.id,
+            id: r.public_id,
             name: r.name,
             package_type: r.package_type,
             original_price: r.original_price,
@@ -79,7 +93,7 @@ impl TryFrom<PackageRow> for Package {
             accent_color: r.accent_color,
             active: r.active,
             sort_order: r.sort_order,
-            created_by: r.created_by,
+            created_by: r.created_by_public_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
             elective_pick_count: r.elective_pick_count,
@@ -89,24 +103,33 @@ impl TryFrom<PackageRow> for Package {
 }
 
 const SELECT_PACKAGE: &str = r#"
-    SELECT id, name, package_type, original_price, sale_price, validity, features,
+    SELECT public_id, name, package_type, original_price, sale_price, validity, features,
            badge, emoji, icon_type, icon_name, icon_url, banner_url, gradient, accent_color, active,
-           sort_order, created_by, created_at, updated_at, elective_pick_count, exam_track
-    FROM packages
+           sort_order,
+           (SELECT public_id FROM core.akun WHERE core.akun.id = ptn.packages.created_by) AS created_by_public_id,
+           created_at, updated_at, elective_pick_count, exam_track
+    FROM ptn.packages
 "#;
 
 #[async_trait]
 impl PackageRepository for PostgresPackageRepository {
-    async fn create(&self, n: NewPackage) -> AppResult<Package> {
-        let id = Uuid::new_v4();
-        sqlx::query(
-            r#"INSERT INTO packages
-                (id, name, package_type, original_price, sale_price, validity, features,
+    async fn create(&self, n: NewPackage, ctx: &TenantCtx) -> AppResult<Package> {
+        let mut tx = self.begin_tx(ctx).await?;
+
+        let created_by: i64 = sqlx::query_scalar("SELECT id FROM core.akun WHERE public_id = $1")
+            .bind(n.created_by)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("created_by lookup failed: {e}")))?;
+
+        let id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO ptn.packages
+                (name, package_type, original_price, sale_price, validity, features,
                  badge, emoji, icon_type, icon_name, icon_url, banner_url, gradient, accent_color, active,
                  sort_order, created_by, elective_pick_count, exam_track)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)"#,
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+               RETURNING id"#,
         )
-        .bind(id)
         .bind(&n.name)
         .bind(&n.package_type)
         .bind(n.original_price)
@@ -123,41 +146,49 @@ impl PackageRepository for PostgresPackageRepository {
         .bind(&n.accent_color)
         .bind(n.active)
         .bind(n.sort_order)
-        .bind(n.created_by)
+        .bind(created_by)
         .bind(n.elective_pick_count)
         .bind(exam_track_str(n.exam_track))
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
 
-        self.find_by_id(id)
-            .await?
-            .ok_or_else(|| crate::error::AppError::Internal(anyhow::anyhow!("package vanished right after insert")))
+        let row = sqlx::query_as::<_, PackageRow>(&format!("{SELECT_PACKAGE} WHERE ptn.packages.id = $1"))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Package::try_from(row)
     }
 
-    async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Package>> {
-        let row = sqlx::query_as::<_, PackageRow>(&format!("{SELECT_PACKAGE} WHERE id = $1"))
+    async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Package>> {
+        let mut tx = self.begin_tx(ctx).await?;
+        let row = sqlx::query_as::<_, PackageRow>(&format!("{SELECT_PACKAGE} WHERE public_id = $1"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        tx.commit().await?;
         row.map(Package::try_from).transpose()
     }
 
-    async fn list(&self) -> AppResult<Vec<Package>> {
+    async fn list(&self, ctx: &TenantCtx) -> AppResult<Vec<Package>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let rows = sqlx::query_as::<_, PackageRow>(&format!("{SELECT_PACKAGE} ORDER BY sort_order ASC, created_at ASC"))
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
         rows.into_iter().map(Package::try_from).collect()
     }
 
-    async fn update(&self, id: Uuid, u: PackageUpdate) -> AppResult<Option<Package>> {
+    async fn update(&self, id: Uuid, u: PackageUpdate, ctx: &TenantCtx) -> AppResult<Option<Package>> {
+        let mut tx = self.begin_tx(ctx).await?;
         let result = sqlx::query(
-            r#"UPDATE packages SET
+            r#"UPDATE ptn.packages SET
                 name = $2, package_type = $3, original_price = $4, sale_price = $5,
                 validity = $6, features = $7, badge = $8, emoji = $9, icon_type = $10,
                 icon_name = $11, icon_url = $12, banner_url = $13, gradient = $14, accent_color = $15,
                 active = $16, sort_order = $17, updated_at = now(), elective_pick_count = $18,
                 exam_track = $19
-               WHERE id = $1"#,
+               WHERE public_id = $1"#,
         )
         .bind(id)
         .bind(&u.name)
@@ -178,32 +209,47 @@ impl PackageRepository for PostgresPackageRepository {
         .bind(u.sort_order)
         .bind(u.elective_pick_count)
         .bind(exam_track_str(u.exam_track))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Ok(None);
         }
-        self.find_by_id(id).await
+        let row = sqlx::query_as::<_, PackageRow>(&format!("{SELECT_PACKAGE} WHERE public_id = $1"))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        row.map(Package::try_from).transpose()
     }
 
-    async fn set_active(&self, id: Uuid, active: bool) -> AppResult<Option<Package>> {
-        let result = sqlx::query("UPDATE packages SET active = $2, updated_at = now() WHERE id = $1")
+    async fn set_active(&self, id: Uuid, active: bool, ctx: &TenantCtx) -> AppResult<Option<Package>> {
+        let mut tx = self.begin_tx(ctx).await?;
+        let result = sqlx::query("UPDATE ptn.packages SET active = $2, updated_at = now() WHERE public_id = $1")
             .bind(id)
             .bind(active)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Ok(None);
         }
-        self.find_by_id(id).await
+        let row = sqlx::query_as::<_, PackageRow>(&format!("{SELECT_PACKAGE} WHERE public_id = $1"))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        row.map(Package::try_from).transpose()
     }
 
-    async fn delete(&self, id: Uuid) -> AppResult<bool> {
-        let result = sqlx::query("DELETE FROM packages WHERE id = $1")
+    async fn delete(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let mut tx = self.begin_tx(ctx).await?;
+        let result = sqlx::query("DELETE FROM ptn.packages WHERE public_id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }

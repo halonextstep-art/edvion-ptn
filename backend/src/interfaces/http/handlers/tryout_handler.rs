@@ -52,10 +52,10 @@ pub async fn create_session(
 
 pub async fn get_session(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(session_id): Path<Uuid>,
 ) -> AppResult<Json<SessionResponse>> {
-    let session = state.tryout_service.get_session(session_id).await?;
+    let session = state.tryout_service.get_session(session_id, &auth.tenant).await?;
     Ok(Json(session.into()))
 }
 

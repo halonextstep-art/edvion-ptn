@@ -208,7 +208,7 @@ pub async fn student_targets(
     Path(student_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<TargetWithChanceResponse>>> {
     authorize_student_edit(&state, &auth, student_id).await?;
-    let results = state.rationalization_service.targets_with_chance_for(student_id).await?;
+    let results = state.rationalization_service.targets_with_chance_for(student_id, &auth.tenant).await?;
     Ok(Json(results.into_iter().map(Into::into).collect()))
 }
 
@@ -241,7 +241,7 @@ async fn record_audit(state: &AppState, auth: &AuthUser, student_id: Uuid, actio
         entity_type: entity_type.to_string(),
         summary,
     };
-    if let Err(e) = state.audit_log_repo.record(entry).await {
+    if let Err(e) = state.audit_log_repo.record(entry, &auth.tenant).await {
         tracing::warn!("gagal mencatat audit log ({entity_type}/{action}) untuk siswa {student_id}: {e}");
     }
 }
@@ -254,7 +254,7 @@ pub async fn student_audit_log(
     Path(student_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<AuditLogEntryResponse>>> {
     authorize_student_edit(&state, &auth, student_id).await?;
-    let entries = state.audit_log_repo.list_by_student(student_id, 50).await?;
+    let entries = state.audit_log_repo.list_by_student(student_id, 50, &auth.tenant).await?;
     Ok(Json(entries.into_iter().map(Into::into).collect()))
 }
 
@@ -271,7 +271,7 @@ pub async fn student_rapor(
     Path(student_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<RaporScoreResponse>>> {
     authorize_student_edit(&state, &auth, student_id).await?;
-    let scores = state.rationalization_service.list_rapor_for(student_id).await?;
+    let scores = state.rationalization_service.list_rapor_for(student_id, &auth.tenant).await?;
     Ok(Json(scores.into_iter().map(Into::into).collect()))
 }
 
@@ -293,7 +293,7 @@ pub async fn upsert_student_rapor(
         s
     };
     let inputs = payload.entries.into_iter().map(Into::into).collect();
-    let saved = state.rationalization_service.upsert_rapor_for(student_id, inputs).await?;
+    let saved = state.rationalization_service.upsert_rapor_for(student_id, inputs, &auth.tenant).await?;
     record_audit(
         &state, &auth, student_id, "upsert", "nilai_rapor",
         format!("Mengisi/memperbarui {count} nilai rapor (semester {semesters:?})"),
@@ -307,7 +307,7 @@ pub async fn delete_student_rapor(
     Path((student_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<serde_json::Value>> {
     authorize_student_edit(&state, &auth, student_id).await?;
-    state.rationalization_service.delete_rapor_for(student_id, id).await?;
+    state.rationalization_service.delete_rapor_for(student_id, id, &auth.tenant).await?;
     record_audit(&state, &auth, student_id, "delete", "nilai_rapor", "Menghapus 1 entri nilai rapor".to_string()).await;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -318,7 +318,7 @@ pub async fn student_achievements(
     Path(student_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<AchievementResponse>>> {
     authorize_student_edit(&state, &auth, student_id).await?;
-    let items = state.rationalization_service.list_achievements_for(student_id).await?;
+    let items = state.rationalization_service.list_achievements_for(student_id, &auth.tenant).await?;
     Ok(Json(items.into_iter().map(Into::into).collect()))
 }
 
@@ -333,7 +333,7 @@ pub async fn add_student_achievement(
     let tingkat = parse_achievement_level(&payload.tingkat)?;
     let nama = payload.nama.clone();
     let input = payload.into_input(tingkat);
-    let created = state.rationalization_service.add_achievement_for(student_id, input).await?;
+    let created = state.rationalization_service.add_achievement_for(student_id, input, &auth.tenant).await?;
     record_audit(&state, &auth, student_id, "create", "prestasi", format!("Menambahkan prestasi: {nama}")).await;
     Ok(Json(created.into()))
 }
@@ -344,7 +344,7 @@ pub async fn delete_student_achievement(
     Path((student_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<serde_json::Value>> {
     authorize_student_edit(&state, &auth, student_id).await?;
-    state.rationalization_service.delete_achievement_for(student_id, id).await?;
+    state.rationalization_service.delete_achievement_for(student_id, id, &auth.tenant).await?;
     record_audit(&state, &auth, student_id, "delete", "prestasi", "Menghapus 1 entri prestasi".to_string()).await;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -361,7 +361,7 @@ pub async fn add_student_target(
     let priority = parse_priority(&payload.priority)?;
     let target = state
         .rationalization_service
-        .add_target_for(student_id, payload.ptn_program_id, track, priority)
+        .add_target_for(student_id, payload.ptn_program_id, track, priority, &auth.tenant)
         .await?;
     record_audit(
         &state, &auth, student_id, "create", "target_ptn",
@@ -379,7 +379,7 @@ pub async fn set_student_target_priority(
     authorize_student_edit(&state, &auth, student_id).await?;
     payload.validate().map_err(|e| AppError::Validation(e.to_string()))?;
     let priority = parse_priority(&payload.priority)?;
-    state.rationalization_service.set_target_priority_for(student_id, id, priority).await?;
+    state.rationalization_service.set_target_priority_for(student_id, id, priority, &auth.tenant).await?;
     record_audit(&state, &auth, student_id, "update", "target_ptn", format!("Mengubah prioritas target menjadi {}", payload.priority)).await;
     Ok(Json(serde_json::json!({ "updated": true })))
 }
@@ -390,7 +390,7 @@ pub async fn remove_student_target(
     Path((student_id, id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<serde_json::Value>> {
     authorize_student_edit(&state, &auth, student_id).await?;
-    state.rationalization_service.remove_target_for(student_id, id).await?;
+    state.rationalization_service.remove_target_for(student_id, id, &auth.tenant).await?;
     record_audit(&state, &auth, student_id, "delete", "target_ptn", "Menghapus 1 target PTN".to_string()).await;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
@@ -403,7 +403,7 @@ pub async fn student_preview_chance(
 ) -> AppResult<Json<ChanceResponse>> {
     authorize_student_edit(&state, &auth, student_id).await?;
     let track = parse_track(&q.track)?;
-    let chance = state.rationalization_service.preview_chance_for(student_id, q.ptn_program_id, track).await?;
+    let chance = state.rationalization_service.preview_chance_for(student_id, q.ptn_program_id, track, &auth.tenant).await?;
     Ok(Json(chance.into()))
 }
 

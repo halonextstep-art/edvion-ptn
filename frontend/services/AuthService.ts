@@ -10,7 +10,12 @@ export interface RegisterPayload {
 }
 
 export interface LoginPayload {
-  email: string
+  // Either a PTN account's own email, or a legacy cross-module account's username (shared
+  // `core.akun` table) — see backend `AuthService::login` doc comment.
+  username: string
+  // Only needed to disambiguate a username login for a specific partner school
+  // (`core.tenant.slug`) — omit for PTN's own email-based accounts, unambiguous without it.
+  tenant_slug?: string | null
   password: string
 }
 

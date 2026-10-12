@@ -37,12 +37,15 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     tracing::info!("connecting to database...");
     let pool = db::create_pool(&config.database_url).await?;
+    // BYPASSRLS, used only for the pre-auth "which tenant is this email in" lookup — see
+    // `AuthService` module doc comment.
+    let auth_lookup_pool = db::create_pool(&config.auth_lookup_database_url).await?;
 
     tracing::info!("running migrations...");
     db::run_migrations(&pool).await?;
 
     // ─── Composition root: wire infrastructure (Postgres) into application services ──
-    let user_repo = Arc::new(PostgresUserRepository::new(pool.clone()));
+    let user_repo = Arc::new(PostgresUserRepository::new(pool.clone(), auth_lookup_pool.clone()));
     let question_repo = Arc::new(PostgresQuestionRepository::new(pool.clone()));
     let question_set_repo = Arc::new(PostgresQuestionSetRepository::new(pool.clone()));
     let session_repo = Arc::new(PostgresTryoutSessionRepository::new(pool.clone()));
@@ -82,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let jwt = Arc::new(JwtService::new(config.jwt_secret.clone(), config.jwt_expiry_hours));
 
-    let auth_service = Arc::new(AuthService::new(user_repo.clone(), jwt.clone()));
+    let auth_service = Arc::new(AuthService::new(user_repo.clone(), jwt.clone(), auth_lookup_pool.clone()));
     let question_service = Arc::new(QuestionService::new(question_repo.clone(), question_set_repo.clone()));
     let event_service = Arc::new(EventService::new(event_repo.clone(), session_repo.clone()));
     let rationalization_service = Arc::new(RationalizationService::new(

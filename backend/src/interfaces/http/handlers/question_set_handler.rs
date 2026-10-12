@@ -12,17 +12,17 @@ use crate::interfaces::http::dto::question_set_dto::{
 use crate::interfaces::http::middleware::AuthUser;
 use crate::interfaces::http::state::AppState;
 
-pub async fn list(State(state): State<AppState>, _auth: AuthUser) -> AppResult<Json<Vec<QuestionSetResponse>>> {
-    let sets = state.question_set_service.list().await?;
+pub async fn list(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<Vec<QuestionSetResponse>>> {
+    let sets = state.question_set_service.list(&auth.tenant).await?;
     Ok(Json(sets.into_iter().map(Into::into).collect()))
 }
 
 pub async fn get_items(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(set_id): Path<Uuid>,
 ) -> AppResult<Json<SetItemsResponse>> {
-    let items = state.question_set_service.get_items(set_id).await?;
+    let items = state.question_set_service.get_items(set_id, &auth.tenant).await?;
     Ok(Json(items.into()))
 }
 

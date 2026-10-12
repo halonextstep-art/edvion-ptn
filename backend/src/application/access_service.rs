@@ -26,6 +26,7 @@ use crate::domain::repository::{
     NewSchoolEntitlement, PackageContentRepository, PackageRepository, SchoolEntitlementRepository, SchoolRepository,
     UserRepository, VoucherRepository,
 };
+use crate::domain::tenant::TenantCtx;
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
 use crate::interfaces::http::middleware::AuthUser;
@@ -73,7 +74,7 @@ impl AccessService {
         actor.require_role(&[Role::Admin])?;
         self.schools.find_by_id(input.school_id).await?
             .ok_or_else(|| AppError::NotFound(format!("school {} not found", input.school_id)))?;
-        self.packages.find_by_id(input.package_id).await?
+        self.packages.find_by_id(input.package_id, &actor.tenant).await?
             .ok_or_else(|| AppError::NotFound(format!("package {} not found", input.package_id)))?;
         if let Some(expires) = input.expires_at {
             if expires < input.starts_at {
@@ -95,7 +96,7 @@ impl AccessService {
         match actor.role {
             Role::Admin => {}
             Role::School => {
-                let user = self.users.find_by_id(actor.user_id).await?
+                let user = self.users.find_by_id(actor.user_id, &actor.tenant).await?
                     .ok_or_else(|| AppError::NotFound("actor user not found".to_string()))?;
                 if user.school_id != Some(school_id) {
                     return Err(AppError::Forbidden("bukan sekolah Anda".to_string()));
@@ -119,9 +120,9 @@ impl AccessService {
     /// belong to a school) their school's active entitlement. This is the raw ownership
     /// signal; whether a given package actually includes the specific content the student
     /// wants is answered separately by `has_access_to_content`.
-    async fn owned_package_ids(&self, student_id: Uuid) -> AppResult<HashSet<Uuid>> {
-        let mut ids: HashSet<Uuid> = self.vouchers.student_redeemed_package_ids(student_id).await?.into_iter().collect();
-        if let Some(user) = self.users.find_by_id(student_id).await? {
+    async fn owned_package_ids(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<HashSet<Uuid>> {
+        let mut ids: HashSet<Uuid> = self.vouchers.student_redeemed_package_ids(student_id, ctx).await?.into_iter().collect();
+        if let Some(user) = self.users.find_by_id(student_id, ctx).await? {
             if let Some(school_id) = user.school_id {
                 let today = chrono::Utc::now().date_naive();
                 ids.extend(self.entitlements.active_entitlement_package_ids(school_id, today).await?);
@@ -132,12 +133,12 @@ impl AccessService {
 
     /// Core per-content check: is there ANY package that (a) includes this exact content item
     /// AND (b) this student owns? Fails closed if the content isn't assigned to any package.
-    async fn has_access_to_content(&self, student_id: Uuid, content_type: PackageContentType, content_id: Uuid) -> AppResult<bool> {
-        let granting_packages = self.content.package_ids_for_content(content_type, content_id).await?;
+    async fn has_access_to_content(&self, student_id: Uuid, content_type: PackageContentType, content_id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let granting_packages = self.content.package_ids_for_content(content_type, content_id, ctx).await?;
         if granting_packages.is_empty() {
             return Ok(false);
         }
-        let owned = self.owned_package_ids(student_id).await?;
+        let owned = self.owned_package_ids(student_id, ctx).await?;
         Ok(granting_packages.into_iter().any(|pid| owned.contains(&pid)))
     }
 
@@ -145,22 +146,22 @@ impl AccessService {
     /// `TryoutSession.is_premium` session is started directly (NOT as part of a Simulasi UTBK
     /// run — see `SimulationService::activate_slot`, which bypasses this per-session check
     /// because access was already verified once at the template level in `start_run`).
-    pub async fn has_access_to_tryout_session(&self, student_id: Uuid, session_id: Uuid) -> AppResult<bool> {
-        self.has_access_to_content(student_id, PackageContentType::TryoutSession, session_id).await
+    pub async fn has_access_to_tryout_session(&self, student_id: Uuid, session_id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        self.has_access_to_content(student_id, PackageContentType::TryoutSession, session_id, ctx).await
     }
 
     /// Called by `SimulationService::start_run` for real server-side enforcement of
     /// `SimulationTemplate.is_premium` — this template previously had NO gating at all.
-    pub async fn has_access_to_simulation_template(&self, student_id: Uuid, template_id: Uuid) -> AppResult<bool> {
-        self.has_access_to_content(student_id, PackageContentType::SimulationTemplate, template_id).await
+    pub async fn has_access_to_simulation_template(&self, student_id: Uuid, template_id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        self.has_access_to_content(student_id, PackageContentType::SimulationTemplate, template_id, ctx).await
     }
 
     /// Everything this student can currently play — one query instead of one round-trip per
     /// content item. Powers `AccessStatusResponse` for the student-facing UI's lock/unlock
     /// icons across both the Tryout list and the Simulasi UTBK list.
-    pub async fn list_unlocked_content(&self, student_id: Uuid) -> AppResult<UnlockedContent> {
-        let owned: Vec<Uuid> = self.owned_package_ids(student_id).await?.into_iter().collect();
-        let pairs = self.content.content_ids_for_packages(&owned).await?;
+    pub async fn list_unlocked_content(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<UnlockedContent> {
+        let owned: Vec<Uuid> = self.owned_package_ids(student_id, ctx).await?.into_iter().collect();
+        let pairs = self.content.content_ids_for_packages(&owned, ctx).await?;
         let mut unlocked = UnlockedContent::default();
         for (content_type, id) in pairs {
             match content_type {
@@ -173,15 +174,15 @@ impl AccessService {
 
     pub async fn my_access_status(&self, actor: &AuthUser) -> AppResult<UnlockedContent> {
         actor.require_role(&[Role::Student])?;
-        self.list_unlocked_content(actor.user_id).await
+        self.list_unlocked_content(actor.user_id, &actor.tenant).await
     }
 
     /// The jenjang (SMP/SMA/SMK/MA) of this student's school, if they belong to one — powers
     /// `TryoutService::list_sessions`/`SimulationService::list_templates`'s
     /// `school_type_scope` catalog filter. `None` for a B2C student (no school at all, so their
     /// jenjang can't be determined — catalog filtering is skipped for them rather than guessed).
-    pub async fn student_school_type(&self, student_id: Uuid) -> AppResult<Option<crate::domain::school::SchoolType>> {
-        let Some(user) = self.users.find_by_id(student_id).await? else { return Ok(None) };
+    pub async fn student_school_type(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<Option<crate::domain::school::SchoolType>> {
+        let Some(user) = self.users.find_by_id(student_id, ctx).await? else { return Ok(None) };
         let Some(school_id) = user.school_id else { return Ok(None) };
         let school = self.schools.find_by_id(school_id).await?;
         Ok(school.map(|s| s.school_type))
