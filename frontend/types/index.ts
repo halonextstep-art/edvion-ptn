@@ -6,8 +6,11 @@ export type UserStatus = 'active' | 'inactive' | 'pending'
 
 export interface User {
   id: string
-  name: string
-  email: string
+  // null for a legacy cross-module account with no name/email on file (e.g. bulk-imported
+  // student rows at partner schools identified only by a `username`/NISN) — see backend
+  // `domain::user::User` doc comments.
+  name?: string | null
+  email?: string | null
   role: Role
   school_id?: string | null
   school_name?: string | null
@@ -36,6 +39,13 @@ export interface User {
 export interface AuthResponse {
   token: string
   user: User
+}
+
+export interface UserListResponse {
+  items: User[]
+  total: number
+  page: number
+  page_size: number
 }
 
 // ─── Profil sendiri (semua role) — lihat backend auth_service::update_profile /

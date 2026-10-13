@@ -250,7 +250,7 @@ impl SchoolRationalizationService {
             let p = participation.iter().find(|p| p.student_id == student.id);
             out.push(SnbpRosterRow {
                 student_id: student.id,
-                student_name: student.name.clone(),
+                student_name: student.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string()),
                 kelas: student.grade.clone(),
                 konsultan: p.map(|p| p.konsultan.clone()).unwrap_or_default(),
                 pilihan_1,
@@ -421,7 +421,7 @@ impl SchoolRationalizationService {
             if let Some((best_chance_percent, tier)) = best {
                 ranking.push(SnbpRankingEntry {
                     student_id: student.id,
-                    student_name: student.name.clone(),
+                    student_name: student.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string()),
                     rapor_avg,
                     prestasi_index: prestasi_bonus,
                     target_count: snbp_targets.len() as i64,
@@ -643,7 +643,7 @@ impl SchoolRationalizationService {
             let tracking = self.snbt_tracking.get_by_student(student.id, &actor.tenant).await?;
             out.push(SnbtRosterRow {
                 student_id: student.id,
-                student_name: student.name.clone(),
+                student_name: student.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string()),
                 pilihan_1,
                 pilihan_2,
                 est_score,

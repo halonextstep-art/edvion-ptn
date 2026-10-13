@@ -84,8 +84,11 @@ pub struct PaymentProviderStatusResponse {
 #[derive(Debug, Serialize)]
 pub struct PendingPurchaseResponse {
     pub transaction: PaymentTransactionResponse,
-    pub buyer_name: String,
-    pub buyer_email: String,
+    // `None` for a buyer whose `core.akun` row has no name/email on file (legacy
+    // cross-module account — see `domain::user::User::email`/`name` doc comments); the
+    // admin review UI shows this honestly rather than fabricating a placeholder.
+    pub buyer_name: Option<String>,
+    pub buyer_email: Option<String>,
     pub package_name: String,
 }
 

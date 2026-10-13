@@ -64,12 +64,28 @@ function avgScoreOf(schoolId: string) {
   return rankings.value.find((r) => r.school_id === schoolId)?.average_score
 }
 
+// `UserService.list` is paginated server-side (max 100/page — see backend
+// `UserListResponse`), but this screen genuinely needs every B2B student across every
+// school at once (per-school roster counts + the full student list in the detail
+// drawer), so page through the whole result set once on load.
+async function fetchAllStudents(): Promise<User[]> {
+  const pageSize = 100
+  const first = await userService.list({ role: 'student', has_school: true, page: 1, page_size: pageSize })
+  const all = [...first.items]
+  const totalPages = Math.ceil(first.total / pageSize)
+  for (let p = 2; p <= totalPages; p++) {
+    const res = await userService.list({ role: 'student', has_school: true, page: p, page_size: pageSize })
+    all.push(...res.items)
+  }
+  return all
+}
+
 async function load() {
   loading.value = true
   try {
     const [sc, us, top] = await Promise.all([
       schoolService.list(),
-      userService.list({ role: 'student' }),
+      fetchAllStudents(),
       analyticsService.topSchools(50),
     ])
     schools.value = sc

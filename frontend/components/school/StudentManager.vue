@@ -74,8 +74,8 @@ const filteredStudents = computed(() => {
     list = list.filter((s) => {
       const st = statMap.value.get(s.id)
       return (
-        s.name.toLowerCase().includes(q) ||
-        s.email.toLowerCase().includes(q) ||
+        (s.name || '').toLowerCase().includes(q) ||
+        (s.email || '').toLowerCase().includes(q) ||
         (s.nisn || '').toLowerCase().includes(q) ||
         (s.grade || '').toLowerCase().includes(q) ||
         (st && st.target_ptn_count > 0 && (q.includes('target') || q.includes('ptn')))
@@ -84,7 +84,7 @@ const filteredStudents = computed(() => {
   }
   list = [...list].sort((a, b) => {
     let cmp = 0
-    if (sortKey.value === 'name') cmp = a.name.localeCompare(b.name)
+    if (sortKey.value === 'name') cmp = (a.name || '').localeCompare(b.name || '')
     else if (sortKey.value === 'avg_score') cmp = (statMap.value.get(a.id)?.avg_score ?? -1) - (statMap.value.get(b.id)?.avg_score ?? -1)
     else if (sortKey.value === 'tryouts') cmp = (statMap.value.get(a.id)?.tryouts_completed ?? 0) - (statMap.value.get(b.id)?.tryouts_completed ?? 0)
     return sortDesc.value ? -cmp : cmp
@@ -164,7 +164,7 @@ function openCreate() {
 }
 function openEdit(u: User) {
   editTarget.value = u
-  name.value = u.name; email.value = u.email; nisn.value = u.nisn || ''; grade.value = u.grade || 'Kelas 12'; status.value = u.status
+  name.value = u.name || ''; email.value = u.email || ''; nisn.value = u.nisn || ''; grade.value = u.grade || 'Kelas 12'; status.value = u.status
   password.value = ''
   showForm.value = true
 }

@@ -63,7 +63,11 @@ struct ContentItemRow {
     public_id: Uuid,
     package_public_id: Uuid,
     content_type: String,
-    content_public_id: Uuid,
+    // `Option` because a dangling reference (the `ptn.tryout_sessions`/
+    // `ptn.simulation_templates` row `content_id` points at was deleted without cleaning
+    // up this join row first — no FK enforces it, see module doc comment) makes BOTH
+    // `LEFT JOIN`s miss, and COALESCE of two NULLs is still NULL.
+    content_public_id: Option<Uuid>,
     content_title: Option<String>,
     created_at: DateTime<Utc>,
 }
@@ -92,7 +96,7 @@ impl TryFrom<ContentItemRow> for PackageContentItem {
             // happen since PackageService validates before insert, but the join is a LEFT JOIN
             // so it can't be ruled out at the DB level) has no `public_id` to report either;
             // fall back to the nil UUID rather than failing the whole list.
-            content_id: r.content_public_id,
+            content_id: r.content_public_id.unwrap_or(Uuid::nil()),
             content_title: r.content_title.unwrap_or_else(|| "(konten tidak ditemukan)".to_string()),
             created_at: r.created_at,
         })
@@ -199,7 +203,13 @@ impl PackageContentRepository for PostgresPackageContentRepository {
             return Ok(Vec::new());
         }
         let mut tx = self.begin_tx(ctx).await?;
-        let rows: Vec<(String, Uuid)> = sqlx::query_as(
+        // `content_public_id` is `Option` for the same dangling-reference reason as
+        // `ContentItemRow` above — a row whose source session/template was deleted without
+        // cleaning up this join first. Unlike the admin-facing list, there's no "(konten
+        // tidak ditemukan)" placeholder to show here; this result feeds a student's
+        // unlocked-content *set*, so a dangling row is simply dropped rather than polluted
+        // with a nil UUID that would never match any real content anyway.
+        let rows: Vec<(String, Option<Uuid>)> = sqlx::query_as(
             r#"SELECT DISTINCT pci.content_type, COALESCE(ts.public_id, st.public_id) AS content_public_id
                FROM ptn.package_content_items pci
                JOIN ptn.packages p ON p.id = pci.package_id
@@ -212,6 +222,7 @@ impl PackageContentRepository for PostgresPackageContentRepository {
         .await?;
         tx.commit().await?;
         rows.into_iter()
+            .filter_map(|(t, id)| id.map(|id| (t, id)))
             .map(|(t, id)| Ok((parse_content_type(&t)?, id)))
             .collect()
     }

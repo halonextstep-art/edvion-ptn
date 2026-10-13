@@ -198,7 +198,7 @@ impl SchoolPortalService {
                 if a.status == AttemptStatus::Submitted {
                     if let Some(submitted_at) = a.submitted_at {
                         out.push(RecentActivityItem {
-                            student_name: student.name.clone(),
+                            student_name: student.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string()),
                             session_title: a.session_title,
                             session_type: a.session_type,
                             score: a.score,

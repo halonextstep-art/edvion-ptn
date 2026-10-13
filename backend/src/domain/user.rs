@@ -115,8 +115,15 @@ impl std::str::FromStr for UserStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct User {
     pub id: Uuid,
-    pub name: String,
-    pub email: String,
+    // `core.akun.full_name` is nullable — same cross-module reality as `email` (see its doc
+    // comment below): some pre-existing accounts were created with no name on file at all.
+    pub name: Option<String>,
+    // `core.akun.email` is nullable — shared with other modules (academic/tahfiz/office/
+    // etc.) whose accounts are sometimes created with only a `username`, never an email
+    // (see `AuthService::login` doc comment). PTN's own self-registered accounts always
+    // have one (enforced by `RegisterRequest`'s `#[validate(email)]`), but any `User` value
+    // that wraps a pre-existing cross-module `core.akun` row must tolerate `None` here.
+    pub email: Option<String>,
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub role: Role,

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -37,6 +37,52 @@ impl PostgresUserRepository {
         .await?;
         Ok(tx)
     }
+
+    /// Shared `WHERE`-clause builder for `list`/`list_page` — kept as one place so the two
+    /// can never drift out of sync with each other (e.g. `list_page`'s `total` silently
+    /// counting a different set of rows than the page it returns).
+    fn build_list_query(filter: &UserFilter) -> QueryBuilder<'static, Postgres> {
+        let mut qb = QueryBuilder::new(SELECT_USER);
+        Self::push_list_conditions(&mut qb, filter);
+        qb
+    }
+
+    fn build_list_count_query(filter: &UserFilter) -> QueryBuilder<'static, Postgres> {
+        let mut qb = QueryBuilder::new(
+            "SELECT COUNT(*) FROM core.akun a
+             JOIN core.role r ON r.id = a.role_id
+             LEFT JOIN core.tenant t ON t.id = a.tenant_id AND a.tenant_id <> 0",
+        );
+        Self::push_list_conditions(&mut qb, filter);
+        qb
+    }
+
+    fn push_list_conditions(qb: &mut QueryBuilder<'static, Postgres>, filter: &UserFilter) {
+        // `core.akun`/`core.role` are shared with academic/tahfiz/office/etc. — without
+        // this, a plain unfiltered listing (e.g. admin's "all users" view) would try to
+        // decode every account in the whole table, including roles PTN has never heard of
+        // (GURU, BK, WAKA_*, ...), and `Role::from_core_role_kode` correctly rejects those
+        // as a 500 rather than silently mis-mapping them. PTN must only ever see its own
+        // four roles here, regardless of what the caller's filter asks for.
+        qb.push(" WHERE r.kode IN ('ADMIN','SEKOLAH','SISWA','KONTEN')");
+        if let Some(role) = filter.role {
+            qb.push(" AND r.kode = ").push_bind(role.core_role_kode());
+        }
+        if let Some(status) = filter.status {
+            qb.push(" AND a.status = ").push_bind(status.as_str());
+        }
+        if let Some(search) = &filter.search {
+            let pattern = format!("%{search}%");
+            qb.push(" AND (a.full_name ILIKE ").push_bind(pattern.clone())
+                .push(" OR a.email ILIKE ").push_bind(pattern).push(")");
+        }
+        if let Some(school_id) = filter.school_id {
+            qb.push(" AND t.public_id = ").push_bind(school_id);
+        }
+        if let Some(has_school) = filter.has_school {
+            qb.push(if has_school { " AND a.tenant_id <> 0" } else { " AND a.tenant_id = 0" });
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -49,8 +95,8 @@ struct LookupRow {
 #[derive(sqlx::FromRow)]
 struct UserRow {
     public_id: Uuid,
-    name: String,
-    email: String,
+    name: Option<String>,
+    email: Option<String>,
     password_hash: String,
     role_kode: String,
     school_public_id: Option<Uuid>,
@@ -238,49 +284,28 @@ impl UserRepository for PostgresUserRepository {
 
     async fn list(&self, filter: UserFilter, ctx: &TenantCtx) -> AppResult<Vec<User>> {
         let mut tx = self.begin_tx(ctx).await?;
-        let mut sql = SELECT_USER.to_string();
-        let mut conditions: Vec<String> = Vec::new();
-        let mut idx = 1;
-        if filter.role.is_some() {
-            conditions.push(format!("r.kode = ${idx}"));
-            idx += 1;
-        }
-        if filter.status.is_some() {
-            conditions.push(format!("a.status = ${idx}"));
-            idx += 1;
-        }
-        if filter.search.is_some() {
-            conditions.push(format!("(a.full_name ILIKE ${idx} OR a.email ILIKE ${idx})"));
-            idx += 1;
-        }
-        if filter.school_id.is_some() {
-            conditions.push(format!("t.public_id = ${idx}"));
-        }
-        if let Some(has_school) = filter.has_school {
-            conditions.push(if has_school { "a.tenant_id <> 0".to_string() } else { "a.tenant_id = 0".to_string() });
-        }
-        if !conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&conditions.join(" AND "));
-        }
-        sql.push_str(" ORDER BY a.created_at DESC");
-
-        let mut query = sqlx::query_as::<_, UserRow>(&sql);
-        if let Some(role) = filter.role {
-            query = query.bind(role.core_role_kode());
-        }
-        if let Some(status) = filter.status {
-            query = query.bind(status.as_str());
-        }
-        if let Some(search) = &filter.search {
-            query = query.bind(format!("%{search}%"));
-        }
-        if let Some(school_id) = filter.school_id {
-            query = query.bind(school_id);
-        }
-        let rows = query.fetch_all(&mut *tx).await?;
+        let mut qb = Self::build_list_query(&filter);
+        qb.push(" ORDER BY a.created_at DESC");
+        let rows = qb.build_query_as::<UserRow>().fetch_all(&mut *tx).await?;
         tx.commit().await?;
         rows.into_iter().map(User::try_from).collect()
+    }
+
+    async fn list_page(&self, filter: UserFilter, ctx: &TenantCtx) -> AppResult<(Vec<User>, i64)> {
+        let mut tx = self.begin_tx(ctx).await?;
+        let page = filter.page.max(1);
+        let page_size = filter.page_size.clamp(1, 100);
+        let offset = (page - 1) * page_size;
+
+        let mut count_qb = Self::build_list_count_query(&filter);
+        let mut qb = Self::build_list_query(&filter);
+        qb.push(" ORDER BY a.created_at DESC LIMIT ").push_bind(page_size).push(" OFFSET ").push_bind(offset);
+
+        let rows = qb.build_query_as::<UserRow>().fetch_all(&mut *tx).await?;
+        let total: i64 = count_qb.build_query_scalar().fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        let users = rows.into_iter().map(User::try_from).collect::<AppResult<Vec<_>>>()?;
+        Ok((users, total))
     }
 
     async fn update(&self, id: Uuid, u: UserUpdate, ctx: &TenantCtx) -> AppResult<Option<User>> {
@@ -301,9 +326,16 @@ impl UserRepository for PostgresUserRepository {
             return Ok(None);
         };
 
+        // `username` is deliberately NOT touched here — it has no corresponding field in
+        // `UserUpdate` (PTN's own accounts only ever set it once, at creation, and legacy
+        // cross-module accounts' `username` is their real login identifier, see
+        // `AuthService::find_lookup_row_by_username`). An earlier version of this query
+        // bound `username = $3` to the email value, which silently overwrote a legacy
+        // account's username with its email on every profile edit/password change —
+        // removed, not just redundant.
         let updated = if let Some(password_hash) = &u.password_hash {
             sqlx::query(
-                r#"UPDATE core.akun SET full_name = $2, email = $3, username = $3, role_id = $4, password_hash = $5,
+                r#"UPDATE core.akun SET full_name = $2, email = $3, role_id = $4, password_hash = $5,
                        status = $6, telepon = $7, minat_jurusan = $8
                    WHERE id = $1"#,
             )
@@ -319,7 +351,7 @@ impl UserRepository for PostgresUserRepository {
             .await?
         } else {
             sqlx::query(
-                r#"UPDATE core.akun SET full_name = $2, email = $3, username = $3, role_id = $4, status = $5, telepon = $6,
+                r#"UPDATE core.akun SET full_name = $2, email = $3, role_id = $4, status = $5, telepon = $6,
                        minat_jurusan = $7
                    WHERE id = $1"#,
             )

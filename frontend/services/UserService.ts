@@ -1,5 +1,5 @@
 import type { ApiClient } from './ApiClient'
-import type { CreateUserPayload, Role, UpdateUserPayload, User, UserStatus } from '~/types'
+import type { CreateUserPayload, Role, UpdateUserPayload, User, UserListResponse, UserStatus } from '~/types'
 
 export interface UserListFilter {
   role?: Role
@@ -7,13 +7,17 @@ export interface UserListFilter {
   search?: string
   /** `true` = only B2B (has a school), `false` = only B2C (mandiri, no school). */
   has_school?: boolean
+  /** Admin-only "filter by sekolah/mitra" dropdown (`School.id`). Ignored for a School actor. */
+  school_id?: string
+  page?: number
+  page_size?: number
 }
 
 export class UserService {
   constructor(private api: ApiClient) {}
 
   list(filter: UserListFilter = {}) {
-    return this.api.get<User[]>('/users', filter as Record<string, unknown>)
+    return this.api.get<UserListResponse>('/users', filter as Record<string, unknown>)
   }
 
   create(payload: CreateUserPayload) {

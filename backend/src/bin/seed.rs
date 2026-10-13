@@ -201,13 +201,13 @@ async fn main() -> anyhow::Result<()> {
     // ─── Admin account first — every other seeded row goes through a service that
     // requires an authenticated Admin actor, so there is no raw-SQL/bypass path left. ──
     let admin = register_or_skip(&auth_service, &pool, "Admin Pusat", "admin@edvionptn.id", "admin123", Role::Admin, None).await?;
-    let admin_actor = AuthUser { user_id: admin.id, email: admin.email.clone(), role: Role::Admin, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
+    let admin_actor = AuthUser { user_id: admin.id, email: admin.email.clone().unwrap_or_default(), role: Role::Admin, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
 
     // ─── Content team (create/edit soal, submit for review) ─────────────────────────
     let content1 = register_or_skip(&auth_service, &pool, "Tim Konten Edvion", "konten@edvion.id", "konten123", Role::Content, None).await?;
-    let content1_actor = AuthUser { user_id: content1.id, email: content1.email.clone(), role: Role::Content, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
+    let content1_actor = AuthUser { user_id: content1.id, email: content1.email.clone().unwrap_or_default(), role: Role::Content, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
     let content2 = register_or_skip(&auth_service, &pool, "Rina Marlina", "rina.konten@edvion.id", "konten123", Role::Content, None).await?;
-    let _content2_actor = AuthUser { user_id: content2.id, email: content2.email.clone(), role: Role::Content, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
+    let _content2_actor = AuthUser { user_id: content2.id, email: content2.email.clone().unwrap_or_default(), role: Role::Content, tenant: edvionptn_backend::domain::tenant::TenantCtx::platform_admin() };
 
     // ─── Schools (created via SchoolService, same code path the admin UI uses) ──────
     type SchoolSeed = (&'static str, SchoolType, &'static str, &'static str, &'static str, &'static str, PackageType, &'static str);
@@ -352,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
     for (idx, student) in students.iter().enumerate() {
         let Some((base, achievement, snbp_targets, snbt_targets)) = profiles.get(idx) else { continue };
         let student_ctx = tenant_ctx_for(&pool, Role::Student, student.school_id).await?;
-        let student_actor = AuthUser { user_id: student.id, email: student.email.clone(), role: Role::Student, tenant: student_ctx };
+        let student_actor = AuthUser { user_id: student.id, email: student.email.clone().unwrap_or_default(), role: Role::Student, tenant: student_ctx };
 
         // Rapor — skip kalau siswa ini sudah punya nilai (idempotent re-run).
         if rationalization_service.list_rapor_for(student.id, &student_ctx).await.unwrap_or_default().is_empty() {
@@ -369,7 +369,7 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             match rationalization_service.upsert_rapor_for(student.id, entries, &student_ctx).await {
                 Ok(saved) => rapor_seeded += saved.len(),
-                Err(e) => println!("skip rapor ({}): {e}", student.name),
+                Err(e) => println!("skip rapor ({}): {e}", student.name.as_deref().unwrap_or("?")),
             }
         }
 
@@ -386,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
                     .await
                 {
                     Ok(_) => achievement_seeded += 1,
-                    Err(e) => println!("skip prestasi ({}): {e}", student.name),
+                    Err(e) => println!("skip prestasi ({}): {e}", student.name.as_deref().unwrap_or("?")),
                 }
             }
         }
@@ -404,7 +404,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 match rationalization_service.add_target_for(student.id, pid, track, priority, &student_ctx).await {
                     Ok(_) => target_seeded += 1,
-                    Err(e) => println!("skip target {track:?} ({} / {keyword}): {e}", student.name),
+                    Err(e) => println!("skip target {track:?} ({} / {keyword}): {e}", student.name.as_deref().unwrap_or("?")),
                 }
             }
         }
@@ -433,7 +433,7 @@ async fn main() -> anyhow::Result<()> {
     let mut eligibility_seeded = 0usize;
     for pic in &school_pics {
         let pic_ctx = tenant_ctx_for(&pool, Role::School, pic.school_id).await?;
-        let pic_actor = AuthUser { user_id: pic.id, email: pic.email.clone(), role: Role::School, tenant: pic_ctx };
+        let pic_actor = AuthUser { user_id: pic.id, email: pic.email.clone().unwrap_or_default(), role: Role::School, tenant: pic_ctx };
 
         let existing_alumni = school_rationalization_service.list_alumni(&pic_actor).await.unwrap_or_default();
         for (name, year, track, ptn, prodi, score) in &alumni_seeds {
@@ -448,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
             {
                 Ok(_) => alumni_seeded += 1,
-                Err(e) => println!("skip alumni ({name} @ {}): {e}", pic.email),
+                Err(e) => println!("skip alumni ({name} @ {}): {e}", pic.email.as_deref().unwrap_or("?")),
             }
         }
 
@@ -459,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
             }
             match school_rationalization_service.upsert_eligibility(&pic_actor, *year, *count).await {
                 Ok(_) => eligibility_seeded += 1,
-                Err(e) => println!("skip eligibility ({year} @ {}): {e}", pic.email),
+                Err(e) => println!("skip eligibility ({year} @ {}): {e}", pic.email.as_deref().unwrap_or("?")),
             }
         }
     }
@@ -476,7 +476,7 @@ async fn main() -> anyhow::Result<()> {
         let Some(school_id) = student.school_id else { continue };
         let Some(pic) = school_pics.iter().find(|p| p.school_id == Some(school_id)) else { continue };
         let pic_ctx = tenant_ctx_for(&pool, Role::School, pic.school_id).await?;
-        let pic_actor = AuthUser { user_id: pic.id, email: pic.email.clone(), role: Role::School, tenant: pic_ctx };
+        let pic_actor = AuthUser { user_id: pic.id, email: pic.email.clone().unwrap_or_default(), role: Role::School, tenant: pic_ctx };
 
         if school_rationalization_service.snbp_roster(&pic_actor).await.is_ok_and(|roster| {
             roster.iter().any(|r| r.student_id == student.id && !r.konsultan.is_empty())
@@ -497,7 +497,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         {
             Ok(_) => participation_seeded += 1,
-            Err(e) => println!("skip roster snbp ({}): {e}", student.name),
+            Err(e) => println!("skip roster snbp ({}): {e}", student.name.as_deref().unwrap_or("?")),
         }
     }
     println!("rasionalisasi sekolah: {participation_seeded} data roster SNBP (konsultan/status) disimpan");
@@ -1034,7 +1034,7 @@ async fn main() -> anyhow::Result<()> {
     for (student_idx, session_title, days_ago, correct_pct) in attempt_plan {
         let Some(student) = students.get(student_idx) else { continue };
         let student_ctx = tenant_ctx_for(&pool, Role::Student, student.school_id).await?;
-        let student_actor = AuthUser { user_id: student.id, email: student.email.clone(), role: Role::Student, tenant: student_ctx };
+        let student_actor = AuthUser { user_id: student.id, email: student.email.clone().unwrap_or_default(), role: Role::Student, tenant: student_ctx };
         let Some(&session_id) = sessions.get(session_title) else { continue };
 
         // Re-run safety: skip if this student already has an attempt on this session
@@ -1050,7 +1050,7 @@ async fn main() -> anyhow::Result<()> {
 
         match simulate_attempt(&tryout_service, &question_service, &pool, &student_actor, session_id, correct_pct, days_ago).await {
             Ok(()) => seeded_attempts += 1,
-            Err(e) => println!("skip attempt ({} / {}): {e}", student.name, session_title),
+            Err(e) => println!("skip attempt ({} / {}): {e}", student.name.as_deref().unwrap_or("?"), session_title),
         }
     }
     println!("total simulated attempts: {seeded_attempts}");

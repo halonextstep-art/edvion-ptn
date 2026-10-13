@@ -201,7 +201,7 @@ impl AuthService {
             })
             .await?;
 
-        let token = self.jwt.issue(user.id, &user.email, user.role, ctx)?;
+        let token = self.jwt.issue(user.id, user.email.as_deref().unwrap_or(""), user.role, ctx)?;
         Ok(AuthenticatedUser { user, token })
     }
 
@@ -244,8 +244,11 @@ impl AuthService {
             UserStatus::Active => {}
         }
 
+        // `core.role` carries roles from every module sharing this table (GURU, BK,
+        // WAKA_*, ...) — an account under one of those isn't "corrupt data", it's simply
+        // not a PTN account, so this is a normal login rejection, not an internal error.
         let role = Role::from_core_role_kode(&row.role_kode)
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("corrupt role in db: {e}")))?;
+            .map_err(|_| AppError::Unauthorized("invalid username or password".to_string()))?;
         let ctx = TenantCtx::for_role(role, row.tenant_id);
 
         self.users.touch_last_login(row.public_id, &ctx).await?;
@@ -257,7 +260,7 @@ impl AuthService {
             .ok_or_else(|| AppError::Internal(anyhow::anyhow!("user vanished right after login")))?;
         user.last_login = Some(chrono::Utc::now());
 
-        let token = self.jwt.issue(user.id, &user.email, user.role, ctx)?;
+        let token = self.jwt.issue(user.id, user.email.as_deref().unwrap_or(""), user.role, ctx)?;
         Ok(AuthenticatedUser { user, token })
     }
 
@@ -331,7 +334,7 @@ impl AuthService {
             .update(
                 user_id,
                 UserUpdate {
-                    name: user.name,
+                    name: user.name.unwrap_or_default(),
                     email: user.email,
                     role: user.role,
                     school_id: user.school_id,
@@ -388,7 +391,7 @@ impl AuthService {
             .update(
                 user.id,
                 UserUpdate {
-                    name: user.name.clone(),
+                    name: user.name.clone().unwrap_or_default(),
                     email: user.email.clone(),
                     role: user.role,
                     school_id: user.school_id,

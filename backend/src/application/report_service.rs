@@ -242,7 +242,7 @@ impl ReportService {
 
             ranking.push(RankingRow {
                 student_id: s.id,
-                student_name: s.name.clone(),
+                student_name: s.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string()),
                 grade: s.grade.clone(),
                 attempt_count: in_period.len() as i64,
                 best_score: best,
@@ -345,7 +345,7 @@ impl ReportService {
             total_attempts += in_period.len() as i64;
             rows.push(ParticipationRow {
                 student_id: s.id,
-                student_name: s.name.clone(),
+                student_name: s.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string()),
                 grade: s.grade.clone(),
                 attempt_count: in_period.len() as i64,
                 last_attempt_at,
@@ -556,7 +556,7 @@ impl ReportService {
 
             student_rows.push(AkreditasiStudentRow {
                 student_id: s.id,
-                student_name: s.name.clone(),
+                student_name: s.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string()),
                 grade: s.grade.clone(),
                 attempt_count: submitted.len() as i64,
                 avg_score: avg,

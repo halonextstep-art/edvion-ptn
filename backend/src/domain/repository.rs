@@ -75,11 +75,21 @@ pub struct UserFilter {
     /// *specific* school rather than "has any school at all" — used by the admin "Manajemen
     /// User" screen's B2B/B2C segment toggle.
     pub has_school: Option<bool>,
+    /// 1-indexed. `core.akun` is shared across every module (academic/tahfiz/office/...),
+    /// so even with the PTN-role scoping in the repository impl, an admin's unfiltered
+    /// "Manajemen User" list can still be thousands of rows — this was previously
+    /// unpaginated and shipped the entire table to the browser on every page load.
+    pub page: i64,
+    pub page_size: i64,
 }
 
 pub struct UserUpdate {
     pub name: String,
-    pub email: String,
+    // `None` is a legitimate value to write back — see `domain::user::User::email` doc
+    // comment. Every PTN-originated write path carries `Some(...)` through unchanged;
+    // only a passthrough update of a pre-existing emailless cross-module account hits
+    // `None` here, and it must round-trip as `NULL`, not get coerced to `""`.
+    pub email: Option<String>,
     pub role: Role,
     pub school_id: Option<Uuid>,
     pub status: UserStatus,
@@ -117,7 +127,16 @@ pub trait UserRepository: Send + Sync {
     /// BYPASSRLS lookup pool, not the regular RLS-scoped one. Only `AuthService::login`/
     /// `register`'s uniqueness check should ever call this.
     async fn find_by_email(&self, email: &str) -> AppResult<Option<User>>;
+    /// Unpaginated — returns every row matching `filter`. Used by internal bulk-fetch
+    /// callers (reports, notification fan-out, rationalization calculations, ...) that
+    /// genuinely want the whole matching set, not a page of it. For the HTTP-facing admin
+    /// "Manajemen User" listing, see `list_page` instead — `UserFilter::page`/`page_size`
+    /// are ignored here.
     async fn list(&self, filter: UserFilter, ctx: &TenantCtx) -> AppResult<Vec<User>>;
+    /// Paginated variant of `list` — returns `(page_of_users, total_matching_count)`. Only
+    /// the HTTP admin/school "Manajemen User" listing should use this; every internal
+    /// bulk-fetch caller should keep using `list`.
+    async fn list_page(&self, filter: UserFilter, ctx: &TenantCtx) -> AppResult<(Vec<User>, i64)>;
     async fn update(&self, id: Uuid, update: UserUpdate, ctx: &TenantCtx) -> AppResult<Option<User>>;
     /// `Ok(false)` if the row didn't exist; a foreign-key conflict (user still owns
     /// questions/sessions) surfaces as `AppError::Conflict`, not a generic 500.

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { Search, Pencil, Trash2, Plus, UserCog, GraduationCap, School as SchoolIcon, Layers, ShieldCheck, UserCheck, UserX, AlertCircle, Eye, RefreshCw, X, Power, Loader2, Clock } from 'lucide-vue-next'
-import type { Attempt, Role, SimulationRunItem, User, UserStatus } from '~/types'
+import { Search, Pencil, Trash2, Plus, UserCog, GraduationCap, School as SchoolIcon, Layers, ShieldCheck, UserCheck, UserX, AlertCircle, Eye, RefreshCw, X, Power, Loader2, Clock, ChevronLeft, ChevronRight } from 'lucide-vue-next'
+import type { Attempt, Role, School, SimulationRunItem, User, UserStatus } from '~/types'
 
-const { userService, settingsService, tryoutService, simulationService } = useApi()
+const { userService, settingsService, tryoutService, simulationService, schoolService } = useApi()
 const { user: currentUser } = useAuth()
 const toast = useToast()
 
@@ -36,8 +36,10 @@ async function toggleB2c() {
   }
 }
 
+const PAGE_SIZE = 20
 const users = ref<User[]>([])
-const allUsers = ref<User[]>([])
+const total = ref(0)
+const page = ref(1)
 const loading = ref(false)
 const search = ref('')
 const filterRole = ref<Role | ''>('')
@@ -45,6 +47,27 @@ const filterStatus = ref<UserStatus | ''>('')
 /** B2B/B2C segment — only meaningful for `role: student`, since school PIC/admin/content
  * accounts are always B2B/no-school by construction. `''` = no filtering. */
 const filterSegment = ref<'' | 'b2b' | 'b2c'>('')
+/** Filter by sekolah/mitra (`School.id`) — populated from `schoolService.list()`, a small
+ * fixed set (dozens, not thousands) so loading it unpaginated is fine. */
+const filterSchoolId = ref('')
+const schools = ref<School[]>([])
+
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
+const rangeStart = computed(() => (total.value === 0 ? 0 : (page.value - 1) * PAGE_SIZE + 1))
+const rangeEnd = computed(() => Math.min(page.value * PAGE_SIZE, total.value))
+
+function goToPage(p: number) {
+  if (p < 1 || p > totalPages.value || p === page.value) return
+  page.value = p
+}
+
+async function loadSchools() {
+  try {
+    schools.value = await schoolService.list()
+  } catch {
+    // non-critical — the mitra filter dropdown just won't populate
+  }
+}
 
 const showForm = ref(false)
 const editTarget = ref<User | null>(null)
@@ -103,23 +126,41 @@ const statusBadge: Record<UserStatus, { label: string; dot: string; class: strin
   pending: { label: 'Pending', dot: 'bg-amber-400', class: 'text-amber-700 bg-amber-50 border-amber-200' },
 }
 
-const roleStats = computed(() => {
-  const active = allUsers.value.filter((u) => u.status === 'active').length
-  const pendingSchools = allUsers.value.filter((u) => u.role === 'school' && u.status === 'pending').length
-  return [
-    { role: null, label: 'Total User', icon: UserCog, color: 'text-slate-700', val: allUsers.value.length, extra: `${active} aktif` },
-    { role: 'student' as Role, label: 'Siswa', icon: GraduationCap, color: 'text-blue-600', val: allUsers.value.filter((u) => u.role === 'student').length, extra: '' },
-    { role: 'school' as Role, label: 'Sekolah', icon: SchoolIcon, color: 'text-emerald-600', val: allUsers.value.filter((u) => u.role === 'school').length, extra: pendingSchools ? `${pendingSchools} pending` : '' },
-    { role: 'content' as Role, label: 'Tim Konten', icon: Layers, color: 'text-violet-600', val: allUsers.value.filter((u) => u.role === 'content').length, extra: '' },
-    { role: 'admin' as Role, label: 'Admin', icon: ShieldCheck, color: 'text-rose-600', val: allUsers.value.filter((u) => u.role === 'admin').length, extra: '' },
-  ]
-})
+// `core.akun` is shared across every module and can run into the thousands of rows (see
+// backend `UserFilter`/`list_page` doc comments) — these counts used to come from loading
+// the ENTIRE table client-side just to `.length` it, which is exactly the "berat sekali"
+// bug this was rewritten to fix. Each stat is now one lightweight `page_size: 1` request
+// (same trick the question bank's status strip already uses) and reads `total`, run in
+// parallel so the strip doesn't serialize 7 round-trips.
+const statTotals = ref({ all: 0, active: 0, student: 0, school: 0, schoolPending: 0, content: 0, admin: 0 })
 
-const pendingCount = computed(() => allUsers.value.filter((u) => u.status === 'pending').length)
+const roleStats = computed(() => [
+  { role: null, label: 'Total User', icon: UserCog, color: 'text-slate-700', val: statTotals.value.all, extra: `${statTotals.value.active} aktif` },
+  { role: 'student' as Role, label: 'Siswa', icon: GraduationCap, color: 'text-blue-600', val: statTotals.value.student, extra: '' },
+  { role: 'school' as Role, label: 'Sekolah', icon: SchoolIcon, color: 'text-emerald-600', val: statTotals.value.school, extra: statTotals.value.schoolPending ? `${statTotals.value.schoolPending} pending` : '' },
+  { role: 'content' as Role, label: 'Tim Konten', icon: Layers, color: 'text-violet-600', val: statTotals.value.content, extra: '' },
+  { role: 'admin' as Role, label: 'Admin', icon: ShieldCheck, color: 'text-rose-600', val: statTotals.value.admin, extra: '' },
+])
+
+const pendingCount = ref(0)
 
 async function loadStats() {
   try {
-    allUsers.value = await userService.list({})
+    const [all, active, student, school, schoolPending, content, admin, pending] = await Promise.all([
+      userService.list({ page_size: 1 }),
+      userService.list({ status: 'active', page_size: 1 }),
+      userService.list({ role: 'student', page_size: 1 }),
+      userService.list({ role: 'school', page_size: 1 }),
+      userService.list({ role: 'school', status: 'pending', page_size: 1 }),
+      userService.list({ role: 'content', page_size: 1 }),
+      userService.list({ role: 'admin', page_size: 1 }),
+      userService.list({ status: 'pending', page_size: 1 }),
+    ])
+    statTotals.value = {
+      all: all.total, active: active.total, student: student.total, school: school.total,
+      schoolPending: schoolPending.total, content: content.total, admin: admin.total,
+    }
+    pendingCount.value = pending.total
   } catch {
     // non-critical for the stat strip
   }
@@ -128,12 +169,17 @@ async function loadStats() {
 async function load() {
   loading.value = true
   try {
-    users.value = await userService.list({
+    const res = await userService.list({
       role: filterRole.value || undefined,
       status: filterStatus.value || undefined,
       search: search.value || undefined,
       has_school: filterSegment.value === 'b2b' ? true : filterSegment.value === 'b2c' ? false : undefined,
+      school_id: filterSchoolId.value || undefined,
+      page: page.value,
+      page_size: PAGE_SIZE,
     })
+    users.value = res.items
+    total.value = res.total
   } catch (e: any) {
     toast.error('Gagal memuat daftar user', e?.message)
   } finally {
@@ -142,10 +188,14 @@ async function load() {
 }
 
 let debounceTimer: ReturnType<typeof setTimeout>
-watch([search, filterRole, filterStatus, filterSegment], () => {
+watch([search, filterRole, filterStatus, filterSegment, filterSchoolId], () => {
   clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(load, 250)
+  debounceTimer = setTimeout(() => {
+    page.value = 1
+    load()
+  }, 250)
 })
+watch(page, load)
 
 // The B2B/B2C segment only applies to students — silently drop it if the role filter moves
 // away from "student" (e.g. via the dropdown, which doesn't go through `filterByRole`).
@@ -157,6 +207,7 @@ onMounted(() => {
   load()
   loadStats()
   loadB2cSetting()
+  loadSchools()
 })
 
 function filterByRole(role: Role | null) {
@@ -225,6 +276,14 @@ function genPassword(seed: string) {
 }
 
 async function resetPassword(u: User) {
+  // Legacy cross-module accounts (shared `core.akun`) can have no name/email on file at
+  // all — the update endpoint requires both, so there's nothing to "preserve unchanged"
+  // here. Ask the admin to fill them in via Edit first rather than sending an incomplete
+  // request that the backend would reject anyway.
+  if (!u.name || !u.email) {
+    toast.error('Akun ini belum punya nama/email', 'Lengkapi datanya lewat tombol Edit sebelum reset password.')
+    return
+  }
   const newPassword = genPassword(u.name)
   try {
     await userService.update(u.id, {
@@ -260,7 +319,7 @@ function formatDate(d?: string | null) {
     <div class="flex items-center justify-between flex-wrap gap-3">
       <div>
         <h2 class="text-lg font-bold flex items-center gap-2"><UserCog class="w-5 h-5 text-indigo-600" />Manajemen User</h2>
-        <p class="text-sm text-muted-foreground">{{ users.length }} akun terdaftar</p>
+        <p class="text-sm text-muted-foreground">{{ total }} akun terdaftar</p>
       </div>
       <Button variant="gradient" @click="openCreate"><Plus class="w-4 h-4" />Tambah Akun</Button>
     </div>
@@ -297,6 +356,10 @@ function formatDate(d?: string | null) {
         <option value="active">Aktif</option>
         <option value="inactive">Nonaktif</option>
         <option value="pending">Pending</option>
+      </select>
+      <select v-model="filterSchoolId" class="px-3 py-2 border rounded-lg text-sm bg-white">
+        <option value="">Semua Sekolah/Mitra</option>
+        <option v-for="s in schools" :key="s.id" :value="s.id">{{ s.name }}</option>
       </select>
     </div>
 
@@ -373,14 +436,14 @@ function formatDate(d?: string | null) {
 
           <div class="flex-1 min-w-0">
             <div class="flex items-center gap-2 flex-wrap">
-              <p class="text-sm font-semibold text-slate-900">{{ u.name }}</p>
+              <p class="text-sm font-semibold text-slate-900">{{ u.name || '(tanpa nama)' }}</p>
               <span class="text-[10px] px-2 py-0.5 rounded-full border font-semibold" :class="roleConfig[u.role]?.bg + ' ' + roleConfig[u.role]?.color">{{ roleConfig[u.role]?.label }}</span>
               <span class="text-[10px] px-2 py-0.5 rounded-full border flex items-center gap-1 font-semibold" :class="statusBadge[u.status]?.class">
                 <span class="w-1.5 h-1.5 rounded-full" :class="statusBadge[u.status]?.dot" />{{ statusBadge[u.status]?.label }}
               </span>
             </div>
             <div class="flex items-center gap-3 mt-0.5 flex-wrap">
-              <p class="text-xs text-slate-500">{{ u.email }}</p>
+              <p class="text-xs text-slate-500">{{ u.email || '(tanpa email)' }}</p>
               <p v-if="u.school_name" class="text-xs text-slate-400">{{ u.school_name }}</p>
               <span v-else-if="u.role === 'student'" class="text-[10px] px-1.5 py-0.5 rounded border border-sky-200 bg-sky-50 text-sky-600 font-semibold">Mandiri (B2C)</span>
               <p v-if="u.grade" class="text-xs text-slate-400">{{ u.grade }}</p>
@@ -419,6 +482,22 @@ function formatDate(d?: string | null) {
               @click="openDelete(u)"
             ><Trash2 class="w-4 h-4" /></button>
           </div>
+        </div>
+      </div>
+
+      <!-- Pagination -->
+      <div v-if="totalPages > 1" class="flex items-center justify-between gap-3 px-5 py-3 border-t">
+        <p class="text-xs text-muted-foreground">Menampilkan {{ rangeStart }}–{{ rangeEnd }} dari {{ total }} akun</p>
+        <div class="flex items-center gap-1.5">
+          <button
+            class="p-1.5 rounded-lg border bg-white text-slate-500 hover:text-slate-800 disabled:opacity-40 disabled:hover:text-slate-500"
+            :disabled="page === 1" @click="goToPage(page - 1)"
+          ><ChevronLeft class="w-4 h-4" /></button>
+          <span class="text-xs font-semibold text-slate-600 px-2">Halaman {{ page }} / {{ totalPages }}</span>
+          <button
+            class="p-1.5 rounded-lg border bg-white text-slate-500 hover:text-slate-800 disabled:opacity-40 disabled:hover:text-slate-500"
+            :disabled="page === totalPages" @click="goToPage(page + 1)"
+          ><ChevronRight class="w-4 h-4" /></button>
         </div>
       </div>
     </Card>

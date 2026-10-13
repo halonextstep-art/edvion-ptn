@@ -8,7 +8,7 @@ use validator::Validate;
 use crate::error::{AppError, AppResult};
 use crate::interfaces::http::dto::auth_dto::UserResponse;
 use crate::interfaces::http::dto::user_dto::{
-    CreateUserPayload, UpdateUserPayload, UserListQuery, UserStatusPayload,
+    CreateUserPayload, UpdateUserPayload, UserListQuery, UserListResponse, UserStatusPayload,
 };
 use crate::interfaces::http::middleware::AuthUser;
 use crate::interfaces::http::state::AppState;
@@ -17,10 +17,17 @@ pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
     Query(q): Query<UserListQuery>,
-) -> AppResult<Json<Vec<UserResponse>>> {
+) -> AppResult<Json<UserListResponse>> {
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(20).clamp(1, 100);
     let filter = q.into_filter()?;
-    let users = state.user_service.list(&auth, filter).await?;
-    Ok(Json(users.into_iter().map(Into::into).collect()))
+    let (users, total) = state.user_service.list(&auth, filter).await?;
+    Ok(Json(UserListResponse {
+        items: users.into_iter().map(Into::into).collect(),
+        total,
+        page,
+        page_size,
+    }))
 }
 
 pub async fn create(

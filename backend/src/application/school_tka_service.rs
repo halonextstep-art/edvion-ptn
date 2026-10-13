@@ -159,7 +159,7 @@ impl SchoolTkaService {
                 }
                 student_rows.push(TkaStudentRow {
                     student_id: student.id,
-                    student_name: student.name.clone(),
+                    student_name: student.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string()),
                     elective_chosen_count: choices.len() as i32,
                     subjects,
                 });

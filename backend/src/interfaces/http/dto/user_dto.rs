@@ -1,10 +1,10 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
 use crate::application::user_service::{CreateUserInput, ListUsersFilter, UpdateUserInput};
 use crate::domain::user::UserStatus;
-use crate::interfaces::http::dto::auth_dto::{parse_role, parse_user_status};
+use crate::interfaces::http::dto::auth_dto::{parse_role, parse_user_status, UserResponse};
 
 #[derive(Debug, Deserialize)]
 pub struct UserListQuery {
@@ -14,14 +14,35 @@ pub struct UserListQuery {
     /// `true` = only B2B accounts (has a school), `false` = only B2C (mandiri, no school).
     /// Omitted = no filtering on this dimension.
     pub has_school: Option<bool>,
+    /// Admin-only "filter by sekolah/mitra" dropdown (`core.tenant.public_id`) — ignored
+    /// for a School actor, who is always hard-scoped to their own school regardless.
+    pub school_id: Option<Uuid>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
 }
 
 impl UserListQuery {
     pub fn into_filter(self) -> Result<ListUsersFilter, crate::error::AppError> {
         let role = self.role.map(|r| parse_role(&r)).transpose()?;
         let status = self.status.map(|s| parse_user_status(&s)).transpose()?;
-        Ok(ListUsersFilter { role, status, search: self.search, has_school: self.has_school })
+        Ok(ListUsersFilter {
+            role,
+            status,
+            search: self.search,
+            has_school: self.has_school,
+            school_id: self.school_id,
+            page: self.page.unwrap_or(1),
+            page_size: self.page_size.unwrap_or(20),
+        })
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserListResponse {
+    pub items: Vec<UserResponse>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
 }
 
 fn default_status() -> String {

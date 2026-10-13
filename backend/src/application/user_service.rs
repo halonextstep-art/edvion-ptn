@@ -20,6 +20,11 @@ pub struct ListUsersFilter {
     /// toggle on the admin "Manajemen User" screen. Ignored for a `Role::School` actor, who
     /// is always scoped to their own school's students regardless (B2B by definition).
     pub has_school: Option<bool>,
+    /// Admin-only "filter by sekolah/mitra" dropdown — ignored for a `Role::School` actor,
+    /// who is always hard-scoped to their own school regardless of what this says.
+    pub school_id: Option<Uuid>,
+    pub page: i64,
+    pub page_size: i64,
 }
 
 pub struct CreateUserInput {
@@ -68,18 +73,32 @@ impl UserService {
     /// forced to `role = Student, school_id = <their own school>` regardless of what the
     /// filter says — a school PIC can never browse another school's roster or non-student
     /// accounts, no matter what query params the client sends.
-    pub async fn list(&self, actor: &AuthUser, filter: ListUsersFilter) -> AppResult<Vec<User>> {
+    pub async fn list(&self, actor: &AuthUser, filter: ListUsersFilter) -> AppResult<(Vec<User>, i64)> {
         actor.require_role(&[Role::Admin, Role::School])?;
+        // A School actor is always hard-scoped to their own school's roster, overriding
+        // whatever the filter says. An Admin actor may optionally filter by `school_id`
+        // too (the "Manajemen User" sekolah/mitra dropdown), but defaults to every school.
         let school_id = match actor.role {
             Role::School => Some(self.resolve_own_school_id(actor).await?),
-            _ => None,
+            _ => filter.school_id,
         };
         let role = if actor.role == Role::School { Some(Role::Student) } else { filter.role };
         // A School actor is already hard-scoped to `school_id = <their own school>` above, so
         // the B2B/B2C toggle only makes sense for an Admin actor browsing the full roster.
         let has_school = if actor.role == Role::School { None } else { filter.has_school };
         self.users
-            .list(UserFilter { role, status: filter.status, search: filter.search, school_id, has_school }, &actor.tenant)
+            .list_page(
+                UserFilter {
+                    role,
+                    status: filter.status,
+                    search: filter.search,
+                    school_id,
+                    has_school,
+                    page: filter.page,
+                    page_size: filter.page_size,
+                },
+                &actor.tenant,
+            )
             .await
     }
 
@@ -158,7 +177,7 @@ impl UserService {
                 id,
                 UserUpdate {
                     name: input.name,
-                    email: input.email,
+                    email: Some(input.email),
                     role: input.role,
                     school_id: input.school_id,
                     status: input.status,

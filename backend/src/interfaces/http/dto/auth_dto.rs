@@ -36,8 +36,12 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize)]
 pub struct UserResponse {
     pub id: Uuid,
-    pub name: String,
-    pub email: String,
+    // `None` for a legacy cross-module account with no `core.akun.full_name`/`email` on
+    // file — see `domain::user::User` doc comments. Real-world example: bulk-imported
+    // student rows at partner schools that only ever got a `username` (NISN-style id), no
+    // name or email. Frontend must handle both being missing.
+    pub name: Option<String>,
+    pub email: Option<String>,
     pub role: String,
     pub school_id: Option<Uuid>,
     pub school_name: Option<String>,
