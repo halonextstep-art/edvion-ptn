@@ -47,13 +47,28 @@ const trend = ref<ScoreTrendPoint[]>([])
 const loadingContext = ref(true)
 const contextError = ref<string | null>(null)
 
+// `UserService.list` is paginated server-side (max 100/page — see backend
+// `UserListResponse`). The backend already scopes a School actor's call to just their own
+// roster, so this only ever pages through ONE school's students, not the whole platform.
+async function fetchAllActiveStudents(): Promise<User[]> {
+  const pageSize = 100
+  const first = await userService.list({ status: 'active', page: 1, page_size: pageSize })
+  const all = [...first.items]
+  const totalPages = Math.ceil(first.total / pageSize)
+  for (let p = 2; p <= totalPages; p++) {
+    const res = await userService.list({ status: 'active', page: p, page_size: pageSize })
+    all.push(...res.items)
+  }
+  return all
+}
+
 async function loadContext() {
   loadingContext.value = true
   contextError.value = null
   try {
     const [o, s, t] = await Promise.all([
       schoolService.overview(),
-      userService.list({ status: 'active' }),
+      fetchAllActiveStudents(),
       analyticsService.schoolScoreTrend(180),
     ])
     overview.value = o

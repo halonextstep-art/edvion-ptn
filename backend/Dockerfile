@@ -4,7 +4,7 @@
 # No sqlx query!/query_as! macros are used anywhere in this codebase (all queries are
 # runtime-checked via query()/query_as::<_, T>()), so the build needs no DATABASE_URL
 # and no .sqlx cache — a plain `cargo build` is sufficient.
-FROM rust:1.89-slim-bookworm AS builder
+FROM rust:1.99-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \

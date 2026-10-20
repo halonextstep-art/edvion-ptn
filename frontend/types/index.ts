@@ -97,8 +97,11 @@ export interface Question {
   status: QuestionStatus
   review_note?: string | null
   reviewed_at?: string | null
-  created_by: string
-  created_by_name: string
+  // null when the creating account isn't visible to the current viewer (e.g. a
+  // platform-wide catalog question authored by an admin under a different tenant) — see
+  // backend `domain::question::Question::created_by` doc comment.
+  created_by?: string | null
+  created_by_name?: string | null
   usage_count: number
   average_score: number
   time_limit?: number | null
@@ -303,6 +306,9 @@ export type SchoolStatus = 'active' | 'inactive' | 'pending'
 export interface School {
   id: string
   name: string
+  /** `core.tenant.slug` — "kode sekolah" needed alongside username for a linked-tenant
+   * student's login (see `LoginPayload.tenant_slug`). */
+  slug: string
   school_type: SchoolType
   city: string
   province: string
@@ -331,6 +337,32 @@ export interface SchoolPayload {
   status?: SchoolStatus
   revenue_share?: number
   monthly_revenue?: number
+  /** Create-only — adopt an existing `core.tenant` (`LinkableTenant.id`) instead of creating
+   * a new one. Ignored on update. */
+  linked_tenant_id?: string | null
+}
+
+/** An existing tenant (from another module) not yet adopted by any PTN school profile. */
+export interface LinkableTenant {
+  id: string
+  name: string
+  slug: string
+}
+
+/** An existing student account at a linked-tenant school with no PTN profile yet. */
+export interface LinkableStudent {
+  id: string
+  name?: string | null
+  email?: string | null
+  username?: string | null
+}
+
+/** Per-school student counts for the admin "Manajemen Sekolah" list — one aggregate
+ * query, not every student row across every school. */
+export interface SchoolRosterCount {
+  school_id: string
+  total_students: number
+  active_students: number
 }
 
 export const PACKAGE_QUOTA: Record<PackageType, number> = { basic: 150, premium: 300, enterprise: 9999 }
@@ -366,6 +398,19 @@ export interface RecentActivityItem {
   session_type: 'tryout' | 'drilling' | 'mini'
   score: number | null
   submitted_at: string
+}
+
+/** One student currently mid-exam, for the School portal's live "Pemantauan Pengerjaan"
+ *  view — either a plain Attempt (Tryout/Drilling/Mini) or a SimulationRun (Simulasi
+ *  UTBK/TKA). `kind`/`ref_id` together are what `SchoolService.forceAbandonActivity` takes
+ *  to act on this exact row. See backend `InProgressActivityItem` doc comment. */
+export interface InProgressActivityItem {
+  kind: 'attempt' | 'simulation_run'
+  ref_id: string
+  student_id: string
+  student_name: string
+  title: string
+  started_at: string
 }
 
 // ─── Users (admin-managed accounts) ────────────────────────────────────────────
@@ -568,6 +613,11 @@ export interface PackageItem {
   elective_pick_count: number
   /** See ExamTrack doc comment. */
   exam_track: ExamTrack
+  /** 'public' (default) = shown to every student/B2C in the "Beli Paket" catalog. 'restricted'
+   *  = only shown to a student whose school has an active School Entitlement for this package
+   *  (or who personally redeemed a voucher for it) — invisible to everyone else, not just
+   *  locked. See backend `domain::package::PackageVisibility` doc comment. */
+  visibility: PackageVisibility
   /** Always 0 — no purchase/checkout system exists yet, so there is no real sales figure. */
   sold_count: number
   /** What this package actually unlocks — e.g. "Simulasi UTBK Batch 1 (Simulasi TO)", "Sesi
@@ -599,7 +649,11 @@ export interface PackagePayload {
   elective_pick_count?: number
   /** See ExamTrack doc comment. Defaults to 'snbt' server-side if omitted. */
   exam_track?: ExamTrack
+  /** See PackageItem.visibility doc comment. Defaults to 'public' server-side if omitted. */
+  visibility?: PackageVisibility
 }
+
+export type PackageVisibility = 'public' | 'restricted'
 
 // ─── School Package Entitlement (admin menyematkan paket ke sekolah — inheritance
 // nyata untuk siswa sekolah tsb, dicek server-side saat start_attempt sesi premium) ────
@@ -656,7 +710,9 @@ export interface QuestionSetItem {
   id: string
   name: string
   description: string
-  created_by: string
+  // null when the creating account isn't visible to the current viewer — see backend
+  // `domain::question_set::QuestionSet::created_by` doc comment.
+  created_by?: string | null
   created_at: string
   updated_at: string
   /** Real, live count of member questions — never fabricated. */
@@ -1608,6 +1664,10 @@ export interface SimulationTemplateItem {
    *  — show "≈" rather than presenting this as exact when the template has any elective slot. */
   total_duration_minutes: number
   slots: SimulationTemplateSlotItem[]
+  /** `true` iff at least one student has a run against this template — the admin edit form
+   *  disables the slot editor (with an explanation) when this is `true`, since editing slots
+   *  after a run exists would desync that run's history from what the template now contains. */
+  has_runs: boolean
   created_at: string
 }
 

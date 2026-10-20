@@ -104,8 +104,11 @@ pub struct QuestionResponse {
     pub status: String,
     pub review_note: Option<String>,
     pub reviewed_at: Option<DateTime<Utc>>,
-    pub created_by: Uuid,
-    pub created_by_name: String,
+    // `None` when the creating account isn't visible to the current viewer (e.g. a
+    // platform-wide catalog question authored by an admin under a different tenant) — see
+    // `domain::question::Question::created_by` doc comment.
+    pub created_by: Option<Uuid>,
+    pub created_by_name: Option<String>,
     pub usage_count: i32,
     pub average_score: f64,
     pub time_limit: Option<i32>,

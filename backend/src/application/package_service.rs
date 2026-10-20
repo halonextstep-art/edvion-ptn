@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::application::question_service::QuestionService;
 use crate::application::simulation_service::SimulationService;
 use crate::application::tryout_service::TryoutService;
-use crate::domain::package::{ExamTrack, Package, PackageContentItem, PackageContentType};
+use crate::domain::package::{ExamTrack, Package, PackageContentItem, PackageContentType, PackageVisibility};
 use crate::domain::repository::{
     NewPackage, PackageContentRepository, PackageRepository, PackageUpdate, SimulationTemplateRepository,
     TryoutSessionRepository,
@@ -46,6 +46,8 @@ pub struct CreatePackageInput {
     /// See `domain::package::Package::elective_pick_count` doc comment.
     pub elective_pick_count: i32,
     pub exam_track: ExamTrack,
+    /// See `domain::package::PackageVisibility` doc comment.
+    pub visibility: PackageVisibility,
 }
 
 pub struct UpdatePackageInput {
@@ -67,6 +69,8 @@ pub struct UpdatePackageInput {
     pub sort_order: i32,
     pub elective_pick_count: i32,
     pub exam_track: ExamTrack,
+    /// See `domain::package::PackageVisibility` doc comment.
+    pub visibility: PackageVisibility,
 }
 
 pub struct PackageService {
@@ -210,6 +214,7 @@ impl PackageService {
                     created_by: actor.user_id,
                     elective_pick_count: input.elective_pick_count,
                     exam_track: input.exam_track,
+                    visibility: input.visibility,
                 },
                 &actor.tenant,
             )
@@ -222,7 +227,7 @@ impl PackageService {
         actor.require_role(&[Role::Admin, Role::Content])?;
         let mut all = self.packages.list(&actor.tenant).await?;
         if actor.role == Role::Content {
-            all.retain(|p| p.created_by == actor.user_id);
+            all.retain(|p| p.created_by == Some(actor.user_id));
         }
         Ok(all)
     }
@@ -231,7 +236,7 @@ impl PackageService {
         actor.require_role(&[Role::Admin, Role::Content])?;
         let pkg = self.packages.find_by_id(package_id, &actor.tenant).await?
             .ok_or_else(|| AppError::NotFound(format!("package {package_id} not found")))?;
-        if actor.role != Role::Admin && pkg.created_by != actor.user_id {
+        if actor.role != Role::Admin && pkg.created_by != Some(actor.user_id) {
             return Err(AppError::Forbidden("Anda hanya bisa melihat paket yang Anda buat sendiri".to_string()));
         }
         Ok(pkg)
@@ -241,7 +246,7 @@ impl PackageService {
         actor.require_role(&[Role::Admin, Role::Content])?;
         let pkg = self.packages.find_by_id(package_id, &actor.tenant).await?
             .ok_or_else(|| AppError::NotFound(format!("package {package_id} not found")))?;
-        if actor.role != Role::Admin && pkg.created_by != actor.user_id {
+        if actor.role != Role::Admin && pkg.created_by != Some(actor.user_id) {
             return Err(AppError::Forbidden("Anda hanya bisa mengubah paket yang Anda buat sendiri".to_string()));
         }
         Ok(pkg)
@@ -257,6 +262,19 @@ impl PackageService {
         let mut all = self.packages.list(&crate::domain::tenant::TenantCtx::platform_admin()).await?;
         all.retain(|p| p.active);
         all.sort_by_key(|p| p.sort_order);
+        Ok(all)
+    }
+
+    /// Catalog for an already-logged-in student's "Beli Paket" showcase — unlike
+    /// `list_public` (the anonymous landing page), this also includes `Restricted`-visibility
+    /// packages the student is allowed to see: `owned_ids` is the caller-supplied set from
+    /// `AccessService::owned_package_ids` (their school's active entitlements + any personal
+    /// voucher redemptions). A `Restricted` package absent from `owned_ids` is skipped
+    /// entirely — invisible, not just locked — so a student never learns a school-specific
+    /// package exists until their school is actually granted it.
+    pub async fn list_for_student(&self, owned_ids: &std::collections::HashSet<Uuid>) -> AppResult<Vec<Package>> {
+        let mut all = self.list_public().await?;
+        all.retain(|p| p.visibility == PackageVisibility::Public || owned_ids.contains(&p.id));
         Ok(all)
     }
 
@@ -313,6 +331,7 @@ impl PackageService {
                     sort_order: input.sort_order,
                     elective_pick_count: input.elective_pick_count,
                     exam_track: input.exam_track,
+                    visibility: input.visibility,
                 },
                 &actor.tenant,
             )
@@ -356,7 +375,7 @@ impl PackageService {
         if actor.role == Role::Content {
             let pkg = self.packages.find_by_id(id, &actor.tenant).await?
                 .ok_or_else(|| AppError::NotFound(format!("package {id} not found")))?;
-            if pkg.created_by != actor.user_id {
+            if pkg.created_by != Some(actor.user_id) {
                 return Err(AppError::Forbidden("Anda hanya bisa menghapus paket yang Anda buat sendiri".to_string()));
             }
             if pkg.active {

@@ -171,7 +171,10 @@ struct BadgeRow {
     condition_type: String,
     condition_value: i32,
     active: bool,
-    created_by: Uuid,
+    // `Option` because the scalar subquery can return NULL when `created_by` points at a
+    // `core.akun` row the current RLS context can't see — see
+    // `domain::gamification::Badge::created_by` doc comment.
+    created_by: Option<Uuid>,
     created_at: DateTime<Utc>,
 }
 
@@ -498,7 +501,10 @@ struct ChallengeRow {
     reward_points: i32,
     reward_badge: Option<String>,
     description: String,
-    created_by: Uuid,
+    // `Option` because the scalar subquery can return NULL when `created_by` points at a
+    // `core.akun` row the current RLS context can't see — see
+    // `domain::gamification::Challenge::created_by` doc comment.
+    created_by: Option<Uuid>,
     created_at: DateTime<Utc>,
 }
 

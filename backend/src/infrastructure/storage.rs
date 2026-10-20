@@ -1,18 +1,56 @@
-//! Local-disk file storage for user uploads (avatar photos, achievement certificates).
-//! Deliberately the simplest thing that works: files are written straight to a local
-//! `uploads/` directory next to wherever the backend binary runs, and served back by
-//! `tower_http::services::ServeDir` mounted at `/uploads` in `router.rs`. No S3/cloud
-//! dependency — sufficient at current scale, and swapping to S3-compatible storage later
-//! only means changing this one module (callers only ever see a returned URL path).
-use std::path::PathBuf;
+//! S3-compatible object storage for user uploads (avatar photos, achievement certificates,
+//! question-import images, package icons/banners). Uploads go straight to the configured
+//! bucket (Wasabi by default — see `S3_*` env vars) instead of local disk, so files survive
+//! container restarts/redeploys and don't depend on a persistent volume. Callers only ever
+//! see the returned public URL, never a filesystem path or bucket key — swapping providers
+//! later only means changing this one module.
+use std::sync::OnceLock;
 
 use axum::extract::multipart::Field;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 
-/// Root directory uploads are written to, relative to the process's working directory.
-const UPLOAD_ROOT: &str = "uploads";
+struct S3Config {
+    client: Client,
+    bucket: String,
+    /// Public base URL files are served from (e.g. a CDN domain in front of the bucket),
+    /// distinct from the S3 API endpoint used to upload — kept separate since Wasabi's
+    /// upload endpoint isn't necessarily the nicest URL to hand back to end users.
+    public_base_url: String,
+}
+
+static S3: OnceLock<S3Config> = OnceLock::new();
+
+async fn s3() -> &'static S3Config {
+    if let Some(cfg) = S3.get() {
+        return cfg;
+    }
+
+    let endpoint = std::env::var("S3_ENDPOINT").expect("S3_ENDPOINT must be set");
+    let access_key = std::env::var("S3_ACCESS_KEY").expect("S3_ACCESS_KEY must be set");
+    let secret_key = std::env::var("S3_SECRET_KEY").expect("S3_SECRET_KEY must be set");
+    let bucket = std::env::var("S3_BUCKET_NAME").expect("S3_BUCKET_NAME must be set");
+    let region = std::env::var("S3_REGION").expect("S3_REGION must be set");
+    let public_base_url = std::env::var("S3_PUBLIC_URL").unwrap_or_else(|_| format!("{endpoint}/{bucket}"));
+
+    let credentials = aws_sdk_s3::config::Credentials::new(access_key, secret_key, None, None, "ptn-env");
+    let config = aws_sdk_s3::config::Builder::new()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .endpoint_url(endpoint)
+        .region(aws_sdk_s3::config::Region::new(region))
+        .credentials_provider(credentials)
+        // Wasabi (and most S3-compatible providers) expect path-style requests
+        // (`endpoint/bucket/key`) rather than AWS's virtual-hosted-style default.
+        .force_path_style(true)
+        .build();
+
+    let client = Client::from_conf(config);
+    let _ = S3.set(S3Config { client, bucket, public_base_url });
+    S3.get().expect("S3 config just set")
+}
 
 /// One allowed upload kind, with its own size cap and accepted MIME types — kept explicit
 /// per call site rather than one shared limit, since a certificate scan is reasonably
@@ -73,16 +111,15 @@ fn extension_for(mime: &str) -> &'static str {
     }
 }
 
-/// Reads one multipart field, validates it against `policy`, and writes it to disk under
-/// `uploads/{policy.subdir}/{uuid}.{ext}`. Returns the URL path clients should use
-/// (`/uploads/{policy.subdir}/{filename}`), never a filesystem path.
+/// Reads one multipart field, validates it against `policy`, and uploads it to the
+/// `{policy.subdir}/{uuid}.{ext}` object key. Returns the public URL clients should use.
 pub async fn save_upload(field: Field<'_>, policy: &UploadPolicy) -> AppResult<String> {
     let content_type = field.content_type().map(|s| s.to_string()).unwrap_or_default();
     let bytes = field.bytes().await.map_err(|e| AppError::Validation(format!("gagal membaca file: {e}")))?;
     save_bytes(&bytes, &content_type, policy).await
 }
 
-/// Same validation/write behavior as `save_upload`, but for bytes already in memory rather
+/// Same validation/upload behavior as `save_upload`, but for bytes already in memory rather
 /// than a live multipart field — used by the bulk question-`.docx`-import pipeline
 /// (`application::question_import_service`), which extracts image bytes directly out of the
 /// uploaded file's `word/media/` folder instead of receiving them as a separate multipart
@@ -107,12 +144,19 @@ pub async fn save_bytes(bytes: &[u8], content_type: &str, policy: &UploadPolicy)
         )));
     }
 
-    let dir: PathBuf = [UPLOAD_ROOT, policy.subdir].iter().collect();
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| AppError::Internal(anyhow::anyhow!("gagal membuat folder upload: {e}")))?;
+    let cfg = s3().await;
+    let key = format!("{}/{}.{}", policy.subdir, Uuid::new_v4(), extension_for(content_type));
 
-    let filename = format!("{}.{}", Uuid::new_v4(), extension_for(content_type));
-    let path = dir.join(&filename);
-    tokio::fs::write(&path, bytes).await.map_err(|e| AppError::Internal(anyhow::anyhow!("gagal menyimpan file: {e}")))?;
+    cfg.client
+        .put_object()
+        .bucket(&cfg.bucket)
+        .key(&key)
+        .body(ByteStream::from(bytes.to_vec()))
+        .content_type(content_type)
+        .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("gagal mengunggah file ke object storage: {e}")))?;
 
-    Ok(format!("/uploads/{}/{}", policy.subdir, filename))
+    Ok(format!("{}/{}", cfg.public_base_url.trim_end_matches('/'), key))
 }

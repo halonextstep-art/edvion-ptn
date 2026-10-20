@@ -45,7 +45,10 @@ struct EventRow {
     status: String,
     prizes: String,
     target_class: String,
-    created_by: Uuid,
+    // `Option` because the scalar subquery can return NULL when `created_by` points at a
+    // `core.akun` row the current RLS context can't see — see
+    // `domain::event::Event::created_by` doc comment.
+    created_by: Option<Uuid>,
     created_at: DateTime<Utc>,
 }
 

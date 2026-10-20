@@ -96,6 +96,9 @@ pub struct Event {
     pub status: EventStatus,
     pub prizes: String,
     pub target_class: String,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context (e.g.
+    // a platform-wide catalog item created by an admin under a different tenant than the
+    // viewer, or a deleted account) — see `postgres_event_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }

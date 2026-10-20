@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Download, RefreshCw, CheckCircle2, AlertCircle, Copy, ShieldCheck, Send, Key, ChevronRight, ChevronLeft, Upload, FileSpreadsheet } from 'lucide-vue-next'
-import type { School } from '~/types'
+import type { LinkableStudent, School } from '~/types'
 import { PACKAGE_QUOTA } from '~/types'
 import { parseStudentImportWorkbook, downloadStudentImportTemplate, importedRowToCreatePayload, type ImportedStudentRow } from '~/utils/studentImportXlsx'
 
@@ -25,6 +25,58 @@ const done = ref(false)
 const createdCount = ref(0)
 const failedRows = ref<{ name: string; reason: string }[]>([])
 
+// A school whose tenant was linked to an existing one (see SchoolFormDialog) already has
+// real student accounts in `core.akun` — "import" there means granting PTN access to
+// selected EXISTING accounts (checklist), not uploading a CSV to create brand-new ones.
+// There's no stored "is this school linked" flag; instead this list IS the signal — a
+// standalone PTN-created tenant simply has no pre-existing SISWA accounts to show here.
+const importMode = ref<'csv' | 'existing'>('csv')
+const linkableStudents = ref<LinkableStudent[]>([])
+const loadingLinkable = ref(false)
+const selectedAkunIds = ref<Set<string>>(new Set())
+const linking = ref(false)
+
+async function loadLinkableStudents() {
+  loadingLinkable.value = true
+  try {
+    linkableStudents.value = await schoolService.linkableStudents(props.school.id)
+    // Default to the existing-account checklist whenever this school actually has any —
+    // that's the strong signal it's a linked tenant, where CSV-creating new accounts
+    // would be the wrong tool (it'd create duplicates alongside the real accounts).
+    importMode.value = linkableStudents.value.length > 0 ? 'existing' : 'csv'
+  } catch (e: any) {
+    toast.error('Gagal memuat daftar siswa existing', e?.message)
+  } finally {
+    loadingLinkable.value = false
+  }
+}
+
+function toggleStudent(id: string) {
+  if (selectedAkunIds.value.has(id)) selectedAkunIds.value.delete(id)
+  else selectedAkunIds.value.add(id)
+}
+
+async function handleLinkExisting() {
+  linking.value = true
+  try {
+    const res = await schoolService.linkStudents(props.school.id, [...selectedAkunIds.value])
+    createdCount.value = res.linked
+    if (props.mode === 'approve') {
+      try {
+        await schoolService.setStatus(props.school.id, 'active')
+      } catch (e: any) {
+        toast.error('Siswa berhasil di-link, tapi gagal mengaktifkan status mitra', e?.message)
+      }
+    }
+    done.value = true
+    emit('saved')
+  } catch (e: any) {
+    toast.error('Gagal memberi akses siswa', e?.message)
+  } finally {
+    linking.value = false
+  }
+}
+
 watch(open, (isOpen) => {
   if (isOpen) {
     step.value = props.mode === 'approve' ? 1 : 2
@@ -35,7 +87,9 @@ watch(open, (isOpen) => {
     done.value = false
     createdCount.value = 0
     failedRows.value = []
+    selectedAkunIds.value = new Set()
     if (fileInput.value) fileInput.value.value = ''
+    loadLinkableStudents()
   }
 })
 
@@ -123,10 +177,22 @@ async function handleActivate() {
         <span class="font-bold text-slate-900">{{ school.name }}</span> {{ mode === 'approve' ? 'kini aktif sebagai mitra.' : 'mendapat siswa baru.' }}
       </p>
       <p class="text-sm text-muted-foreground mb-6">
-        <span class="font-bold text-green-600">{{ createdCount }} akun siswa</span> berhasil dibuat dan siap digunakan.
-        <span v-if="failedRows.length" class="block text-red-500 mt-1">{{ failedRows.length }} baris gagal ({{ failedRows.map(f => f.name).join(', ') }}).</span>
+        <template v-if="importMode === 'existing'">
+          <span class="font-bold text-green-600">{{ createdCount }} siswa existing</span> berhasil diberi akses PTN.
+        </template>
+        <template v-else>
+          <span class="font-bold text-green-600">{{ createdCount }} akun siswa</span> berhasil dibuat dan siap digunakan.
+          <span v-if="failedRows.length" class="block text-red-500 mt-1">{{ failedRows.length }} baris gagal ({{ failedRows.map(f => f.name).join(', ') }}).</span>
+        </template>
       </p>
-      <div class="p-4 bg-blue-50 border border-blue-200 rounded-xl text-left mb-6">
+      <div v-if="importMode === 'existing'" class="p-4 bg-blue-50 border border-blue-200 rounded-xl text-left mb-6">
+        <p class="text-xs font-bold text-blue-700 mb-1.5 flex items-center gap-1"><Send class="w-3.5 h-3.5" />Langkah Selanjutnya</p>
+        <ul class="text-xs text-blue-800 space-y-1.5">
+          <li>&bull; Siswa login dengan <strong>username/email dan password asli mereka</strong> (tidak berubah)</li>
+          <li>&bull; Jika login via username, siswa perlu memasukkan kode sekolah: <span class="font-mono font-bold">{{ school.slug }}</span></li>
+        </ul>
+      </div>
+      <div v-else class="p-4 bg-blue-50 border border-blue-200 rounded-xl text-left mb-6">
         <p class="text-xs font-bold text-blue-700 mb-1.5 flex items-center gap-1"><Send class="w-3.5 h-3.5" />Langkah Selanjutnya</p>
         <ul class="text-xs text-blue-800 space-y-1.5">
           <li>&bull; Kirim daftar kredensial ke PIC sekolah: <span class="font-bold">{{ schoolEmail }}</span></li>
@@ -135,7 +201,7 @@ async function handleActivate() {
         </ul>
       </div>
       <div class="flex gap-3">
-        <Button variant="outline" class="flex-1 gap-2" @click="copyCredentials"><Copy class="w-4 h-4" />Salin Kredensial</Button>
+        <Button v-if="importMode === 'csv'" variant="outline" class="flex-1 gap-2" @click="copyCredentials"><Copy class="w-4 h-4" />Salin Kredensial</Button>
         <Button class="flex-1 bg-green-600 hover:bg-green-700" @click="open = false">Selesai</Button>
       </div>
     </div>
@@ -179,13 +245,49 @@ async function handleActivate() {
         </div>
       </div>
 
-      <!-- Step 2: import xlsx -->
+      <!-- Step 2: import siswa -->
       <div v-if="step === 2" class="space-y-5">
         <div class="flex items-center justify-between flex-wrap gap-2">
-          <div>
-            <h4 class="font-bold text-slate-900">Import Data Siswa</h4>
-            <p class="text-sm text-muted-foreground">Kuota: <span class="font-bold text-indigo-600">{{ quota === 9999 ? 'Unlimited' : quota }} siswa</span></p>
+          <h4 class="font-bold text-slate-900">Import Data Siswa</h4>
+          <div class="flex rounded-lg border bg-white p-0.5">
+            <button
+              type="button" class="px-3 py-1 rounded-md text-xs font-semibold transition-colors"
+              :class="importMode === 'existing' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50'"
+              @click="importMode = 'existing'"
+            >Siswa Existing ({{ linkableStudents.length }})</button>
+            <button
+              type="button" class="px-3 py-1 rounded-md text-xs font-semibold transition-colors"
+              :class="importMode === 'csv' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50'"
+              @click="importMode = 'csv'"
+            >Upload .xlsx</button>
           </div>
+        </div>
+
+        <!-- Checklist akun existing (sekolah linked-tenant) -->
+        <div v-if="importMode === 'existing'" class="space-y-3">
+          <p class="text-xs text-muted-foreground">
+            Sekolah ini sudah punya akun siswa asli (dari modul lain). Centang siswa mana saja yang boleh akses PTN —
+            tidak membuat akun baru, tidak mengubah username/password mereka.
+          </p>
+          <div v-if="loadingLinkable" class="text-center text-sm text-muted-foreground py-6">Memuat...</div>
+          <div v-else-if="linkableStudents.length === 0" class="text-center text-sm text-muted-foreground py-6 border border-dashed rounded-xl">
+            Tidak ada siswa existing yang bisa di-link (semua sudah punya akses, atau sekolah ini bukan tenant yang di-link).
+          </div>
+          <div v-else class="border rounded-xl overflow-hidden max-h-72 overflow-y-auto divide-y">
+            <label v-for="s in linkableStudents" :key="s.id" class="flex items-center gap-3 px-3 py-2.5 hover:bg-slate-50 cursor-pointer">
+              <input type="checkbox" :checked="selectedAkunIds.has(s.id)" class="w-4 h-4" @change="toggleStudent(s.id)" />
+              <div class="min-w-0 flex-1">
+                <p class="text-sm font-semibold text-slate-800 truncate">{{ s.name || '(tanpa nama)' }}</p>
+                <p class="text-xs text-muted-foreground truncate">{{ s.email || s.username || '—' }}</p>
+              </div>
+            </label>
+          </div>
+          <p class="text-xs font-semibold text-indigo-600">{{ selectedAkunIds.size }} siswa dipilih</p>
+        </div>
+
+        <template v-else>
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <p class="text-sm text-muted-foreground">Kuota: <span class="font-bold text-indigo-600">{{ quota === 9999 ? 'Unlimited' : quota }} siswa</span></p>
           <Button variant="outline" size="sm" class="gap-2" @click="downloadTemplate"><Download class="w-4 h-4" />Template .xlsx</Button>
         </div>
         <div class="p-3 bg-slate-50 border rounded-xl">
@@ -239,10 +341,12 @@ async function handleActivate() {
           </div>
           <p v-if="readyRows.length > quota" class="text-xs text-red-600 mt-2 flex items-center gap-1"><AlertCircle class="w-3 h-3" />Melebihi kuota paket ({{ quota }} siswa).</p>
         </div>
+        </template>
       </div>
 
-      <!-- Step 3: activate -->
-      <div v-if="step === 3" class="space-y-5">
+      <!-- Step 3: activate (CSV mode only — existing-account mode skips straight from
+           step 2's checklist to handleLinkExisting, see the nav buttons below) -->
+      <div v-if="step === 3 && importMode === 'csv'" class="space-y-5">
         <div>
           <h4 class="font-bold text-slate-900 mb-1">Preview Akun yang Akan Dibuat</h4>
           <p class="text-sm text-muted-foreground"><span class="font-bold text-green-600">{{ readyRows.length }} akun siswa</span> akan dibuat lewat backend — bukan simulasi.</p>
@@ -291,7 +395,20 @@ async function handleActivate() {
         <Button variant="outline" class="gap-1" @click="step === 1 || (step === 2 && mode === 'import') ? (open = false) : (step = (step - 1) as Step)">
           <ChevronLeft v-if="!(step === 1 || (step === 2 && mode === 'import'))" class="w-4 h-4" />{{ step === 1 || (step === 2 && mode === 'import') ? 'Batal' : 'Kembali' }}
         </Button>
-        <Button v-if="step < 3" variant="gradient" :disabled="step === 2 && (rows.length === 0 || readyRows.length === 0 || readyRows.length > quota)" @click="step = (step + 1) as Step">
+        <!-- Existing-account mode has no CSV preview step — confirm straight from the
+             checklist at step 2. -->
+        <Button
+          v-if="step === 2 && importMode === 'existing'"
+          class="bg-green-600 hover:bg-green-700 gap-2" :disabled="linking || selectedAkunIds.size === 0"
+          @click="handleLinkExisting"
+        >
+          <ShieldCheck class="w-4 h-4" />{{ linking ? 'Memproses...' : `Beri Akses (${selectedAkunIds.size})` }}
+        </Button>
+        <Button
+          v-else-if="step < 3" variant="gradient"
+          :disabled="step === 2 && (rows.length === 0 || readyRows.length === 0 || readyRows.length > quota)"
+          @click="step = (step + 1) as Step"
+        >
           Lanjut<ChevronRight class="w-4 h-4" />
         </Button>
         <Button v-else class="bg-green-600 hover:bg-green-700 gap-2" :disabled="creating" @click="handleActivate">

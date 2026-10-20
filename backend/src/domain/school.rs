@@ -107,6 +107,10 @@ impl std::str::FromStr for SchoolStatus {
 pub struct School {
     pub id: Uuid,
     pub name: String,
+    /// `core.tenant.slug` — the "kode sekolah" a legacy/linked-tenant student types in
+    /// alongside their username to disambiguate login (see `AuthService::login` doc
+    /// comment); irrelevant for a student with a real email (always unambiguous).
+    pub slug: String,
     pub school_type: SchoolType,
     pub city: String,
     pub province: String,
@@ -121,4 +125,38 @@ pub struct School {
     /// Contracted plan value in Rupiah, admin-recorded (no billing system yet).
     pub monthly_revenue: i64,
     pub created_at: DateTime<Utc>,
+}
+
+/// An existing `core.tenant` not yet adopted by any `ptn.school_profile` — the "link to
+/// existing tenant" dropdown shown when creating a new Mitra. Deliberately a small, separate
+/// shape (not the full `School`) since `ptn.school_profile` doesn't exist for it yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkableTenant {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: String,
+}
+
+/// Per-school student counts for the admin "Manajemen Sekolah" list — one aggregate query
+/// instead of fetching every student row across every school just to `.length` them (see
+/// `SchoolRepository::roster_counts` doc comment).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SchoolRosterCount {
+    pub school_id: Uuid,
+    pub total_students: i64,
+    pub active_students: i64,
+}
+
+/// An existing `core.akun` row (role = SISWA) at a linked-tenant school that has no
+/// `ptn.student_profile` yet — the checklist shown in the import-siswa step for a
+/// linked-tenant Mitra, instead of the CSV bulk-create form used for a standalone one. See
+/// `SchoolService`/`UserRepository` doc comments on why this never touches `core.akun`
+/// itself (no role mutation, no password reset — the account's existing credentials keep
+/// working exactly as they do in whichever module created them).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkableStudent {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub username: Option<String>,
 }

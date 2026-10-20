@@ -18,7 +18,7 @@ use crate::domain::gamification::{
     Badge, BadgeConditionType, BadgeWithStats, Challenge, ChallengeStatus, ChallengeType, ChallengeWithStats,
     LeaderboardEntry, LeaderboardRange, PointRule, Rarity,
 };
-use crate::domain::package::{ExamTrack, Package, PackageContentItem, PackageContentType};
+use crate::domain::package::{ExamTrack, Package, PackageContentItem, PackageContentType, PackageVisibility};
 use crate::domain::question::{Difficulty, Question, QuestionStatus, QuestionType};
 use crate::domain::question_set::QuestionSet;
 use crate::domain::rationalization::{
@@ -164,6 +164,12 @@ pub struct NewSchool {
     pub status: SchoolStatus,
     pub revenue_share: i32,
     pub monthly_revenue: i64,
+    /// `Some(core.tenant.public_id)` to adopt an EXISTING tenant (e.g. a school already
+    /// onboarded by academic/tahfiz/office, with its own real students in `core.akun`)
+    /// instead of creating a brand-new `core.tenant` row. `None` = today's behavior
+    /// (always `INSERT INTO core.tenant`). See `SchoolRepository::create` doc comment —
+    /// this never mutates the existing tenant/its accounts, only adds `ptn.school_profile`.
+    pub linked_tenant_id: Option<Uuid>,
 }
 
 pub struct SchoolUpdate {
@@ -189,6 +195,24 @@ pub trait SchoolRepository: Send + Sync {
     async fn delete(&self, id: Uuid) -> AppResult<bool>;
     /// Cheap targeted status flip for the approve/deactivate/reactivate quick actions.
     async fn set_status(&self, id: Uuid, status: SchoolStatus) -> AppResult<Option<School>>;
+    /// Every `core.tenant` NOT already adopted by a `ptn.school_profile` — the "link to
+    /// existing tenant" dropdown's data source. Excludes the reserved platform tenant
+    /// (id 0), which is never a real school.
+    async fn list_unlinked_tenants(&self) -> AppResult<Vec<crate::domain::school::LinkableTenant>>;
+    /// One `GROUP BY`, not N+1/fetch-everything — the admin "Manajemen Sekolah" list's
+    /// per-school student/active-student counts. `core.akun` can run into the thousands of
+    /// rows across every school (shared with academic/tahfiz/office/etc.), so this must
+    /// never be "fetch every student, then count client-side" again.
+    async fn roster_counts(&self) -> AppResult<Vec<crate::domain::school::SchoolRosterCount>>;
+    /// `core.akun` rows under `school_id`'s tenant with `role = SISWA` and no
+    /// `ptn.student_profile` yet — see `LinkableStudent` doc comment.
+    async fn list_linkable_students(&self, school_id: Uuid) -> AppResult<Vec<crate::domain::school::LinkableStudent>>;
+    /// Creates `ptn.student_profile` for each selected existing `core.akun` (must already
+    /// be `role = SISWA` at `school_id`'s tenant) — the linked-tenant equivalent of CSV
+    /// bulk-import, but adopting accounts that already exist instead of creating new ones.
+    /// Returns how many profiles were actually created (an id already profiled, or not
+    /// SISWA at this tenant, is silently skipped rather than erroring the whole batch).
+    async fn link_existing_students(&self, school_id: Uuid, akun_ids: &[Uuid]) -> AppResult<i64>;
 }
 
 // ─── Analytics (read-only aggregations — no CRUD) ──────────────────────────────
@@ -514,6 +538,11 @@ pub trait AttemptRepository: Send + Sync {
     ) -> AppResult<AttemptAnswer>;
     async fn answers_for_attempt(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Vec<AttemptAnswer>>;
     async fn submit(&self, attempt_id: Uuid, submission: AttemptSubmission, ctx: &TenantCtx) -> AppResult<Attempt>;
+    /// Force-clears an `InProgress` attempt to `Abandoned` — see
+    /// `domain::tryout::AttemptStatus::Abandoned` doc comment. `Ok(None)` if the attempt
+    /// doesn't exist OR isn't currently `InProgress` (nothing to abandon); callers should
+    /// treat both the same way (there's nothing more specific the caller can usefully do).
+    async fn force_abandon(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Attempt>>;
     /// Persist correctness for each answer once graded (called during submit).
     async fn grade_answer(&self, answer_id: Uuid, is_correct: bool, ctx: &TenantCtx) -> AppResult<()>;
     /// Platform-wide correct/total counts per question, from every graded `attempt_answers` row
@@ -550,6 +579,8 @@ pub struct NewPackage {
     pub elective_pick_count: i32,
     /// See `domain::package::ExamTrack` doc comment.
     pub exam_track: ExamTrack,
+    /// See `domain::package::PackageVisibility` doc comment.
+    pub visibility: PackageVisibility,
 }
 
 pub struct PackageUpdate {
@@ -571,6 +602,8 @@ pub struct PackageUpdate {
     pub sort_order: i32,
     pub elective_pick_count: i32,
     pub exam_track: ExamTrack,
+    /// See `domain::package::PackageVisibility` doc comment.
+    pub visibility: PackageVisibility,
 }
 
 // Every method takes `ctx: &TenantCtx` — `ptn.packages` carries RLS.
@@ -1156,12 +1189,34 @@ pub struct NewSimulationTemplate {
     pub lockdown_override: Option<bool>,
 }
 
+/// Full-edit payload for an existing template — see `SimulationTemplateRepository::update`.
+/// Unlike `NewSimulationTemplate`, `slots`/`elective_package_id` are `Option<Vec<_>>`/left
+/// untouched when `None`: the service layer only passes `Some(slots)` when it has already
+/// verified (via `has_any_run`) that no student has a run against this template yet, since
+/// replacing slots for a template with run history would silently desync that history (see
+/// `SimulationService::update_template` doc comment).
+pub struct UpdateSimulationTemplate {
+    pub title: String,
+    pub is_premium: bool,
+    /// `None` leaves the existing slots (and `elective_package_id`) untouched.
+    pub slots: Option<Vec<NewSimulationTemplateSlot>>,
+    pub elective_package_id: Option<Uuid>,
+    pub template_kind: crate::domain::simulation::SimulationTemplateKind,
+    pub exam_track: ExamTrack,
+    pub school_type_scope: Option<SchoolType>,
+    pub lockdown_override: Option<bool>,
+}
+
 #[async_trait]
 pub trait SimulationTemplateRepository: Send + Sync {
     async fn create(&self, input: NewSimulationTemplate, ctx: &TenantCtx) -> AppResult<SimulationTemplate>;
     async fn find_by_id(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
     /// `only_active = true` filters to `is_active = true` (used for the student-facing list).
     async fn list(&self, only_active: bool, ctx: &TenantCtx) -> AppResult<Vec<SimulationTemplate>>;
+    /// `true` iff at least one `simulation_runs` row references this template — used by
+    /// `SimulationService::update_template` to decide whether slot edits are still safe.
+    async fn has_any_run(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool>;
+    async fn update(&self, id: Uuid, input: UpdateSimulationTemplate, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
     async fn set_active(&self, id: Uuid, active: bool, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
     async fn set_premium(&self, id: Uuid, is_premium: bool, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>>;
     /// Cheap targeted toggle — used by `PackageService::set_active`'s publish cascade and by

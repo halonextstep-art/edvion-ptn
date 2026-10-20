@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Sparkles } from 'lucide-vue-next'
-import type { PackageType, School, SchoolStatus, SchoolType } from '~/types'
+import type { LinkableTenant, PackageType, School, SchoolStatus, SchoolType } from '~/types'
 
 const open = defineModel<boolean>({ default: false })
 const props = defineProps<{ editSchool?: School | null }>()
@@ -22,7 +22,26 @@ const revenueShare = ref(10)
 const monthlyRevenue = ref(0)
 const saving = ref(false)
 
+// Create-only — adopt an existing `core.tenant` (already onboarded by another module,
+// with its own real students) instead of creating a brand-new one. Can't be changed once
+// a school is created, so this is hidden entirely while editing.
+const linkMode = ref<'new' | 'existing'>('new')
+const linkedTenantId = ref('')
+const unlinkedTenants = ref<LinkableTenant[]>([])
+const loadingTenants = ref(false)
+
 const isEditing = computed(() => !!props.editSchool)
+
+async function loadUnlinkedTenants() {
+  loadingTenants.value = true
+  try {
+    unlinkedTenants.value = await schoolService.unlinkedTenants()
+  } catch (e: any) {
+    toast.error('Gagal memuat daftar tenant', e?.message)
+  } finally {
+    loadingTenants.value = false
+  }
+}
 
 function resetForm(s?: School | null) {
   name.value = s?.name || ''
@@ -36,16 +55,31 @@ function resetForm(s?: School | null) {
   status.value = s?.status || (s ? 'active' : 'pending')
   revenueShare.value = s?.revenue_share ?? 10
   monthlyRevenue.value = s?.monthly_revenue ?? 0
+  linkMode.value = 'new'
+  linkedTenantId.value = ''
 }
 
 watch(open, (isOpen) => {
-  if (isOpen) resetForm(props.editSchool)
+  if (isOpen) {
+    resetForm(props.editSchool)
+    if (!isEditing.value) loadUnlinkedTenants()
+  }
+})
+
+// Prefill nama/slug when a tenant is picked — admin can still edit the rest, but the
+// school name defaulting to the tenant's own name avoids an easy-to-miss mismatch.
+watch(linkedTenantId, (id) => {
+  const t = unlinkedTenants.value.find((t) => t.id === id)
+  if (t && !name.value.trim()) name.value = t.name
 })
 
 async function save() {
   if (!name.value.trim()) return toast.error('Nama sekolah tidak boleh kosong!')
   if (!email.value.trim()) return toast.error('Email tidak boleh kosong!')
   if (!contactPerson.value.trim()) return toast.error('Nama kontak person harus diisi!')
+  if (!isEditing.value && linkMode.value === 'existing' && !linkedTenantId.value) {
+    return toast.error('Pilih tenant yang akan di-link!')
+  }
 
   saving.value = true
   try {
@@ -61,6 +95,7 @@ async function save() {
       status: status.value,
       revenue_share: revenueShare.value,
       monthly_revenue: monthlyRevenue.value,
+      ...(!isEditing.value && linkMode.value === 'existing' ? { linked_tenant_id: linkedTenantId.value } : {}),
     }
     if (isEditing.value && props.editSchool) {
       await schoolService.update(props.editSchool.id, payload)
@@ -82,6 +117,33 @@ async function save() {
 <template>
   <Dialog v-model="open" :title="isEditing ? 'Edit Sekolah Mitra' : 'Tambah Sekolah Mitra'" max-width="max-w-lg">
     <div class="space-y-4">
+      <div v-if="!isEditing" class="p-3 border rounded-lg bg-slate-50 space-y-2">
+        <Label>Sumber Data Sekolah</Label>
+        <div class="flex rounded-lg border bg-white p-0.5 w-fit">
+          <button
+            type="button" class="px-3 py-1 rounded-md text-xs font-semibold transition-colors"
+            :class="linkMode === 'new' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50'"
+            @click="linkMode = 'new'"
+          >Tenant Baru</button>
+          <button
+            type="button" class="px-3 py-1 rounded-md text-xs font-semibold transition-colors"
+            :class="linkMode === 'existing' ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:bg-slate-50'"
+            @click="linkMode = 'existing'"
+          >Link ke Tenant Existing</button>
+        </div>
+        <div v-if="linkMode === 'existing'">
+          <select v-model="linkedTenantId" class="w-full mt-1 px-3 py-2 border rounded-md text-sm bg-white">
+            <option value="" disabled>{{ loadingTenants ? 'Memuat...' : 'Pilih tenant...' }}</option>
+            <option v-for="t in unlinkedTenants" :key="t.id" :value="t.id">{{ t.name }} ({{ t.slug }})</option>
+          </select>
+          <p class="text-xs text-muted-foreground mt-1.5">
+            Sekolah ini sudah terdaftar di modul lain (akademik/tahfiz/dll) dengan siswa aslinya sendiri. PTN akan
+            memakai data sekolah/siswa yang sudah ada — gunakan tombol "Import Siswa" nanti untuk memilih siswa
+            mana saja yang boleh akses PTN, bukan membuat akun baru.
+          </p>
+        </div>
+      </div>
+
       <div>
         <Label>Nama Sekolah</Label>
         <Input v-model="name" placeholder="Contoh: SMA Negeri 1 Jakarta" class="mt-1.5" />

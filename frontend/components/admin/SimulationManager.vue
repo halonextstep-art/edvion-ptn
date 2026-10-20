@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { Plus, Trash2, ChevronUp, ChevronDown, Timer, Layers, Clock, Lock, Unlock, ListChecks, Gauge, RefreshCw, Info, ShieldAlert } from 'lucide-vue-next'
-import type { TryoutSessionTemplate, SimulationTemplateItem, SimulationTemplateKind, SchoolType, PackageItem, ScoreDisplayMode, IrtCalibrationStatus } from '~/types'
+import { Plus, Pencil, Trash2, ChevronUp, ChevronDown, Timer, Layers, Clock, Lock, Unlock, ListChecks, Gauge, RefreshCw, Info, ShieldAlert } from 'lucide-vue-next'
+import type { TryoutSessionTemplate, SimulationTemplateItem, SimulationTemplateKind, SimulationTemplatePayload, SchoolType, PackageItem, ScoreDisplayMode, IrtCalibrationStatus } from '~/types'
 
 const { tryoutService, simulationService, packageService, settingsService } = useApi()
 const toast = useToast()
@@ -109,6 +109,13 @@ const templatesLoading = ref(false)
 const showForm = ref(false)
 const saving = ref(false)
 const actionId = ref<string | null>(null)
+// `null` = form sedang membuat template baru. Diisi id-nya saat admin klik "Edit" pada salah
+// satu kartu template — `submitTemplate` lalu memanggil updateTemplate() bukan createTemplate().
+const editingId = ref<string | null>(null)
+// Slot/subtes dibekukan begitu template punya histori run (lihat backend
+// `SimulationService::update_template` doc comment) — disalin dari template yang di-edit
+// supaya form bisa menampilkan status "terkunci" tanpa perlu request tambahan.
+const editingHasRuns = ref(false)
 
 interface SlotRow {
   session_id: string
@@ -195,6 +202,8 @@ function resetForm() {
   schoolTypeScope.value = null
   lockdownOverride.value = null
   showForm.value = false
+  editingId.value = null
+  editingHasRuns.value = false
 }
 
 function toggleForm() {
@@ -203,6 +212,24 @@ function toggleForm() {
   } else {
     showForm.value = true
   }
+}
+
+/** Mengisi form dari template yang sudah ada dan beralih ke mode edit — lihat `editingId`. */
+function startEdit(t: SimulationTemplateItem) {
+  editingId.value = t.id
+  editingHasRuns.value = t.has_runs
+  title.value = t.title
+  isPremium.value = t.is_premium
+  rows.value = t.slots.map((s) => ({
+    session_id: s.session_id ?? '',
+    break_seconds: s.break_seconds,
+    is_elective: s.is_elective,
+  }))
+  electivePackageId.value = t.elective_package_id ?? ''
+  templateKind.value = t.template_kind
+  schoolTypeScope.value = t.school_type_scope ?? null
+  lockdownOverride.value = t.lockdown_override ?? null
+  showForm.value = true
 }
 
 function addRow() {
@@ -247,59 +274,73 @@ function formatDuration(minutes: number) {
 }
 
 async function submitTemplate() {
+  // Slot/subtes sudah dibekukan di backend begitu template punya histori run (lihat
+  // `editingHasRuns`) — form tidak perlu memvalidasi isi rows sama sekali dalam kasus itu,
+  // karena rows tetap dikirim tapi backend akan mengabaikannya dan memakai slot lama.
+  const slotsLocked = editingId.value !== null && editingHasRuns.value
+
   if (!title.value.trim()) {
     toast.error('Judul template wajib diisi')
     return
   }
-  if (rows.value.length === 0) {
-    toast.error('Tambahkan minimal 1 subtes')
-    return
+  if (!slotsLocked) {
+    if (rows.value.length === 0) {
+      toast.error('Tambahkan minimal 1 subtes')
+      return
+    }
+    if (rows.value.some((r) => !r.is_elective && !r.session_id)) {
+      toast.error('Setiap subtes (bukan mapel pilihan) harus memilih sesi')
+      return
+    }
+    const sessionIds = rows.value.filter((r) => !r.is_elective).map((r) => r.session_id)
+    if (new Set(sessionIds).size !== sessionIds.length) {
+      toast.error('Satu sesi tidak boleh dipakai dua kali dalam template yang sama')
+      return
+    }
+    if (hasElectiveRow.value && !electivePackageId.value) {
+      toast.error('Pilih paket sumber "Mapel Pilihan" untuk slot yang ditandai Mapel Pilihan')
+      return
+    }
+    const electiveRowCount = rows.value.filter((r) => r.is_elective).length
+    if (hasElectiveRow.value && electivePackage.value && electivePackage.value.elective_pick_count !== electiveRowCount) {
+      toast.error(
+        `Jumlah slot Mapel Pilihan (${electiveRowCount}) harus sama dengan "Jumlah Mapel Pilihan" pada paket "${electivePackage.value.name}" (${electivePackage.value.elective_pick_count})`,
+      )
+      return
+    }
   }
-  if (rows.value.some((r) => !r.is_elective && !r.session_id)) {
-    toast.error('Setiap subtes (bukan mapel pilihan) harus memilih sesi')
-    return
-  }
-  const sessionIds = rows.value.filter((r) => !r.is_elective).map((r) => r.session_id)
-  if (new Set(sessionIds).size !== sessionIds.length) {
-    toast.error('Satu sesi tidak boleh dipakai dua kali dalam template yang sama')
-    return
-  }
-  if (hasElectiveRow.value && !electivePackageId.value) {
-    toast.error('Pilih paket sumber "Mapel Pilihan" untuk slot yang ditandai Mapel Pilihan')
-    return
-  }
-  const electiveRowCount = rows.value.filter((r) => r.is_elective).length
-  if (hasElectiveRow.value && electivePackage.value && electivePackage.value.elective_pick_count !== electiveRowCount) {
-    toast.error(
-      `Jumlah slot Mapel Pilihan (${electiveRowCount}) harus sama dengan "Jumlah Mapel Pilihan" pada paket "${electivePackage.value.name}" (${electivePackage.value.elective_pick_count})`,
-    )
-    return
+
+  const payload: SimulationTemplatePayload = {
+    title: title.value.trim(),
+    is_premium: isPremium.value,
+    slots: rows.value.map((r, i) => ({
+      sequence_index: i + 1,
+      session_id: r.is_elective ? null : r.session_id,
+      break_seconds: r.break_seconds,
+      is_elective: r.is_elective,
+    })),
+    elective_package_id: hasElectiveRow.value ? electivePackageId.value : null,
+    template_kind: templateKind.value,
+    // Sama seperti backfill migration exam_track — per_subject hampir selalu berarti TKA
+    // (real TKA tidak pernah menggabungkan skor lintas mata uji), utbk_combined berarti SNBT.
+    exam_track: templateKind.value === 'per_subject' ? 'tka' : 'snbt',
+    school_type_scope: schoolTypeScope.value,
+    lockdown_override: lockdownOverride.value,
   }
 
   saving.value = true
   try {
-    await simulationService.createTemplate({
-      title: title.value.trim(),
-      is_premium: isPremium.value,
-      slots: rows.value.map((r, i) => ({
-        sequence_index: i + 1,
-        session_id: r.is_elective ? null : r.session_id,
-        break_seconds: r.break_seconds,
-        is_elective: r.is_elective,
-      })),
-      elective_package_id: hasElectiveRow.value ? electivePackageId.value : null,
-      template_kind: templateKind.value,
-      // Sama seperti backfill migration exam_track — per_subject hampir selalu berarti TKA
-      // (real TKA tidak pernah menggabungkan skor lintas mata uji), utbk_combined berarti SNBT.
-      exam_track: templateKind.value === 'per_subject' ? 'tka' : 'snbt',
-      school_type_scope: schoolTypeScope.value,
-      lockdown_override: lockdownOverride.value,
-    })
-    toast.success('Template simulasi berhasil dibuat!')
+    if (editingId.value) {
+      await simulationService.updateTemplate(editingId.value, payload)
+      toast.success('Template simulasi berhasil diperbarui!')
+    } else {
+      await simulationService.createTemplate(payload)
+      toast.success('Template simulasi berhasil dibuat!')
+    }
     resetForm()
     await loadTemplates()
   } catch (e: any) {
-    toast.error('Gagal membuat template simulasi', e?.message)
+    toast.error(editingId.value ? 'Gagal memperbarui template simulasi' : 'Gagal membuat template simulasi', e?.message)
   } finally {
     saving.value = false
   }
@@ -465,6 +506,14 @@ async function deleteTemplate(t: SimulationTemplateItem) {
     </Card>
 
     <Card v-if="showForm" class="p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-sm font-bold text-slate-900">{{ editingId ? 'Edit Template Simulasi' : 'Buat Template Simulasi Baru' }}</h3>
+      </div>
+      <p v-if="editingId && editingHasRuns" class="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+        Template ini sudah dikerjakan oleh siswa — susunan subtes di bawah terkunci (tidak bisa diubah) agar riwayat pengerjaan siswa
+        tetap konsisten. Judul, status premium, jenjang, jenis simulasi, dan Mode Terkunci tetap bisa diubah.
+      </p>
+
       <div>
         <label class="text-xs font-medium text-slate-600 mb-1 block">Judul Template</label>
         <input
@@ -526,7 +575,7 @@ async function deleteTemplate(t: SimulationTemplateItem) {
       <div>
         <div class="flex items-center justify-between mb-2">
           <label class="text-xs font-medium text-slate-600">Urutan Subtes</label>
-          <Button size="sm" variant="outline" class="text-xs gap-1.5" :disabled="sessionsLoading" @click="addRow">
+          <Button v-if="!(editingId && editingHasRuns)" size="sm" variant="outline" class="text-xs gap-1.5" :disabled="sessionsLoading" @click="addRow">
             <Plus class="w-3.5 h-3.5" />Tambah Subtes
           </Button>
         </div>
@@ -535,7 +584,7 @@ async function deleteTemplate(t: SimulationTemplateItem) {
         <div v-else-if="rows.length === 0" class="p-6 text-center text-xs text-muted-foreground border border-dashed rounded-lg">
           Belum ada subtes. Klik "Tambah Subtes" untuk mulai menyusun urutan.
         </div>
-        <div v-else class="space-y-2">
+        <div v-else class="space-y-2" :class="{ 'opacity-60 pointer-events-none': editingId && editingHasRuns }">
           <div v-for="(row, i) in rows" :key="i" class="flex items-center gap-2 p-2.5 border rounded-lg bg-slate-50 flex-wrap">
             <span class="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center shrink-0">{{ i + 1 }}</span>
             <select v-if="!row.is_elective" v-model="row.session_id" class="flex-1 min-w-0 px-2.5 py-1.5 border rounded-lg text-xs bg-white">
@@ -598,7 +647,9 @@ async function deleteTemplate(t: SimulationTemplateItem) {
 
       <div class="flex justify-end gap-2">
         <Button variant="outline" :disabled="saving" @click="resetForm">Batal</Button>
-        <Button variant="gradient" :disabled="saving" @click="submitTemplate">{{ saving ? 'Menyimpan...' : 'Simpan Template' }}</Button>
+        <Button variant="gradient" :disabled="saving" @click="submitTemplate">
+          {{ saving ? 'Menyimpan...' : editingId ? 'Simpan Perubahan' : 'Simpan Template' }}
+        </Button>
       </div>
     </Card>
 
@@ -638,6 +689,15 @@ async function deleteTemplate(t: SimulationTemplateItem) {
               <option value="on">Terkunci: paksa aktif</option>
               <option value="off">Terkunci: paksa nonaktif</option>
             </select>
+            <Button
+              size="sm"
+              variant="outline"
+              class="text-xs gap-1"
+              :disabled="actionId === t.id"
+              @click="startEdit(t)"
+            >
+              <Pencil class="w-3.5 h-3.5" />Edit
+            </Button>
             <Button
               size="sm"
               variant="outline"

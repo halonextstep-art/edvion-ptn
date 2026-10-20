@@ -47,7 +47,9 @@ pub struct AdmissionDeadline {
     pub label: String,
     pub description: String,
     pub deadline_date: NaiveDate,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context — see
+    // `postgres_admission_deadline_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

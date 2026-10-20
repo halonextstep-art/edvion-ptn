@@ -186,6 +186,7 @@ impl From<Attempt> for AttemptResponse {
             status: match a.status {
                 crate::domain::tryout::AttemptStatus::InProgress => "in_progress".to_string(),
                 crate::domain::tryout::AttemptStatus::Submitted => "submitted".to_string(),
+                crate::domain::tryout::AttemptStatus::Abandoned => "abandoned".to_string(),
             },
             duration_minutes: a.duration_minutes,
             started_at: a.started_at,

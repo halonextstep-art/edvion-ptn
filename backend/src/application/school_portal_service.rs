@@ -12,7 +12,13 @@
 
 use std::sync::Arc;
 
-use crate::domain::repository::{AttemptRepository, PtnProgramRepository, PtnTargetRepository, UserFilter, UserRepository};
+use chrono::Utc;
+use uuid::Uuid;
+
+use crate::domain::repository::{
+    AttemptRepository, PtnProgramRepository, PtnTargetRepository, SimulationRunRepository, UserFilter, UserRepository,
+};
+use crate::domain::simulation::SimulationRunStatus;
 use crate::domain::tryout::{AttemptStatus, SessionType};
 use crate::domain::user::Role;
 use crate::error::{AppError, AppResult};
@@ -56,11 +62,34 @@ pub struct RecentActivityItem {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One student currently mid-exam, for the School portal's live "Pemantauan Pengerjaan"
+/// view — either a plain `Attempt` (Tryout/Drilling/Mini) or a `SimulationRun` (Simulasi
+/// UTBK/TKA), normalized to the same shape since the school PIC doesn't need to care which
+/// kind it is to decide whether to step in. `kind`/`ref_id` together are what
+/// `force_abandon_activity` takes to act on this exact row.
+pub struct InProgressActivityItem {
+    pub kind: InProgressActivityKind,
+    /// The `Attempt.id` or `SimulationRun.id` — opaque to the caller, round-tripped back into
+    /// `force_abandon_activity`.
+    pub ref_id: Uuid,
+    pub student_id: Uuid,
+    pub student_name: String,
+    pub title: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InProgressActivityKind {
+    Attempt,
+    SimulationRun,
+}
+
 pub struct SchoolPortalService {
     users: Arc<dyn UserRepository>,
     attempts: Arc<dyn AttemptRepository>,
     ptn_targets: Arc<dyn PtnTargetRepository>,
     programs: Arc<dyn PtnProgramRepository>,
+    simulation_runs: Arc<dyn SimulationRunRepository>,
 }
 
 impl SchoolPortalService {
@@ -69,8 +98,9 @@ impl SchoolPortalService {
         attempts: Arc<dyn AttemptRepository>,
         ptn_targets: Arc<dyn PtnTargetRepository>,
         programs: Arc<dyn PtnProgramRepository>,
+        simulation_runs: Arc<dyn SimulationRunRepository>,
     ) -> Self {
-        Self { users, attempts, ptn_targets, programs }
+        Self { users, attempts, ptn_targets, programs, simulation_runs }
     }
 
     pub async fn overview(&self, actor: &AuthUser) -> AppResult<SchoolOverview> {
@@ -211,6 +241,114 @@ impl SchoolPortalService {
         out.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
         out.truncate(limit);
         Ok(out)
+    }
+
+    /// Live "Pemantauan Pengerjaan" feed — every `InProgress` Attempt AND SimulationRun
+    /// across the school's whole roster, oldest-started first (so a student who's been stuck
+    /// the longest surfaces at the top, where the school PIC is most likely to need to step
+    /// in). The frontend polls this on an interval rather than this method doing anything
+    /// push-based — there is no realtime/websocket infrastructure anywhere in this codebase
+    /// (see `domain::tryout::AttemptStatus::Abandoned` doc comment for the companion
+    /// force-abandon half of this feature). N+1 over the roster, same acceptable-at-this-scale
+    /// tradeoff as every other method in this file.
+    pub async fn in_progress_activity(&self, actor: &AuthUser) -> AppResult<Vec<InProgressActivityItem>> {
+        actor.require_role(&[Role::School])?;
+        let school_id = self.resolve_own_school_id(actor).await?;
+        let students = self
+            .users
+            .list(UserFilter { role: Some(Role::Student), school_id: Some(school_id), ..Default::default() }, &actor.tenant)
+            .await?;
+
+        let mut out = Vec::new();
+        for student in &students {
+            let student_name = student.name.clone().unwrap_or_else(|| "(tanpa nama)".to_string());
+
+            let attempts = self.attempts.list_by_student(student.id, &actor.tenant).await?;
+            for a in attempts {
+                if a.status == AttemptStatus::InProgress {
+                    out.push(InProgressActivityItem {
+                        kind: InProgressActivityKind::Attempt,
+                        ref_id: a.id,
+                        student_id: student.id,
+                        student_name: student_name.clone(),
+                        title: a.session_title,
+                        started_at: a.started_at,
+                    });
+                }
+            }
+
+            let runs = self.simulation_runs.list_by_student(student.id, &actor.tenant).await?;
+            for r in runs {
+                if r.status == SimulationRunStatus::InProgress {
+                    out.push(InProgressActivityItem {
+                        kind: InProgressActivityKind::SimulationRun,
+                        ref_id: r.id,
+                        student_id: student.id,
+                        student_name: student_name.clone(),
+                        title: r.template_title,
+                        started_at: r.started_at,
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+        Ok(out)
+    }
+
+    /// Force-clears one student's stuck in-progress activity (plain Attempt OR SimulationRun
+    /// — `kind` picks which) so they can start a fresh one. Unlike the student's own
+    /// self-service `SimulationService::abandon_run`, this is School-initiated and requires
+    /// ownership of the activity's student, not ownership of the activity itself. Does not
+    /// touch the underlying `attempt_answers`/`simulation_run_slots` rows — those keep
+    /// whatever partial progress they already have, only the parent's status changes.
+    pub async fn force_abandon_activity(&self, actor: &AuthUser, kind: InProgressActivityKind, ref_id: Uuid) -> AppResult<()> {
+        actor.require_role(&[Role::School])?;
+        let school_id = self.resolve_own_school_id(actor).await?;
+
+        match kind {
+            InProgressActivityKind::Attempt => {
+                let attempt = self
+                    .attempts
+                    .find_by_id(ref_id, &actor.tenant)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound(format!("attempt {ref_id} not found")))?;
+                self.ensure_owns_student_id(school_id, attempt.student_id, &actor.tenant).await?;
+                self.attempts
+                    .force_abandon(ref_id, &actor.tenant)
+                    .await?
+                    .ok_or_else(|| AppError::Validation("attempt ini sudah tidak sedang berjalan".to_string()))?;
+                Ok(())
+            }
+            InProgressActivityKind::SimulationRun => {
+                let run = self
+                    .simulation_runs
+                    .find_by_id(ref_id, &actor.tenant)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound(format!("run {ref_id} not found")))?;
+                self.ensure_owns_student_id(school_id, run.student_id, &actor.tenant).await?;
+                if run.status != SimulationRunStatus::InProgress {
+                    return Err(AppError::Validation("simulasi ini sudah tidak sedang berjalan".to_string()));
+                }
+                self.simulation_runs
+                    .set_run_status(ref_id, SimulationRunStatus::Abandoned, Some(Utc::now()), None, &actor.tenant)
+                    .await
+            }
+        }
+    }
+
+    /// Same check as `ensure_owns_student`, but takes a resolved `school_id` directly — used by
+    /// `force_abandon_activity`, which already resolved its own school_id once and would
+    /// otherwise re-resolve it redundantly per call via `ensure_owns_student`.
+    async fn ensure_owns_student_id(&self, school_id: Uuid, student_id: Uuid, ctx: &crate::domain::tenant::TenantCtx) -> AppResult<()> {
+        let student = self
+            .users
+            .find_by_id(student_id, ctx)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("student {student_id} not found")))?;
+        if student.role != Role::Student || student.school_id != Some(school_id) {
+            return Err(AppError::Forbidden("kamu hanya bisa mengelola data siswa dari sekolahmu sendiri".to_string()));
+        }
+        Ok(())
     }
 
     /// Verifies the acting School PIC's own school actually owns `student_id` (i.e. the

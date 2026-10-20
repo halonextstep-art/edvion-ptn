@@ -53,7 +53,10 @@ struct QuestionSetRow {
     public_id: Uuid,
     name: String,
     description: String,
-    created_by_public_id: Uuid,
+    // `Option` because the scalar subquery can return NULL when `created_by` points at a
+    // `core.akun` row the current RLS context can't see — see
+    // `domain::question_set::QuestionSet::created_by` doc comment.
+    created_by_public_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     item_count: i64,
@@ -106,8 +109,11 @@ struct SetQuestionRow {
     review_note: Option<String>,
     reviewed_by_public_id: Option<Uuid>,
     reviewed_at: Option<DateTime<Utc>>,
-    created_by_public_id: Uuid,
-    created_by_name: String,
+    // Both `Option` because the scalar subqueries below can return NULL when `created_by`
+    // points at a `core.akun` row the current RLS context can't see — see
+    // `domain::question::Question::created_by` doc comment.
+    created_by_public_id: Option<Uuid>,
+    created_by_name: Option<String>,
     usage_count: i32,
     average_score: f64,
     time_limit: Option<i32>,

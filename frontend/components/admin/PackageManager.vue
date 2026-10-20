@@ -59,6 +59,7 @@ function blankForm(): PackagePayload {
     gradient: GRADIENT_OPTIONS[0].value, accent_color: GRADIENT_OPTIONS[0].accent,
     active: true, sort_order: packages.value.length + 1,
     elective_pick_count: 0,
+    visibility: 'public',
   }
 }
 const form = ref<PackagePayload>(blankForm())
@@ -146,6 +147,7 @@ function openEdit(p: PackageItem) {
     gradient: p.gradient, accent_color: p.accent_color,
     active: p.active, sort_order: p.sort_order,
     elective_pick_count: p.elective_pick_count ?? 0,
+    visibility: p.visibility,
   }
   showForm.value = true
 }
@@ -283,6 +285,7 @@ function fmt(n: number) {
             <span class="text-lg font-black" :style="{ color: p.accent_color }">Rp {{ fmt(p.sale_price) }}</span>
             <span class="text-xs text-muted-foreground line-through">Rp {{ fmt(p.original_price) }}</span>
             <Badge variant="outline" class="text-emerald-600 border-emerald-300">-{{ p.discount }}%</Badge>
+            <Badge v-if="p.visibility === 'restricted'" variant="secondary" class="!bg-amber-100 !text-amber-700">Khusus Mitra</Badge>
           </div>
           <ul class="space-y-1">
             <li v-for="(f, i) in p.features" :key="i" class="text-xs text-slate-600 flex items-start gap-1.5">
@@ -328,6 +331,7 @@ function fmt(n: number) {
                   <p class="font-semibold text-slate-900 flex items-center gap-1.5">
                     {{ p.name }}
                     <span v-if="isEmpty(p.id)" class="inline-flex items-center gap-0.5 text-[10px] text-red-600 font-bold"><AlertTriangle class="w-3 h-3" />Kosong</span>
+                    <Badge v-if="p.visibility === 'restricted'" variant="secondary" class="!bg-amber-100 !text-amber-700 text-[10px]">Khusus Mitra</Badge>
                   </p>
                   <p class="text-xs text-muted-foreground">{{ p.package_type }}</p>
                 </div>
@@ -453,6 +457,30 @@ function fmt(n: number) {
                   <component :is="form.active ? Eye : EyeOff" class="w-6 h-6" :class="form.active ? 'text-emerald-500' : 'text-slate-300'" />
                 </button>
                 <p class="text-sm font-medium">{{ form.active ? 'Tampil di landing page' : 'Disembunyikan' }}</p>
+              </div>
+            </div>
+
+            <div>
+              <label class="text-xs font-semibold text-slate-500 uppercase tracking-wider block mb-1.5">Visibilitas Paket</label>
+              <div class="flex gap-2">
+                <button
+                  type="button"
+                  class="flex-1 px-3 py-2.5 rounded-lg border text-sm font-medium text-left transition-colors"
+                  :class="form.visibility === 'public' ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600'"
+                  @click="form.visibility = 'public'"
+                >
+                  Umum
+                  <p class="text-[11px] font-normal mt-0.5 opacity-80">Tampil di katalog "Beli Paket" semua siswa/sekolah</p>
+                </button>
+                <button
+                  type="button"
+                  class="flex-1 px-3 py-2.5 rounded-lg border text-sm font-medium text-left transition-colors"
+                  :class="form.visibility === 'restricted' ? 'border-indigo-500 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600'"
+                  @click="form.visibility = 'restricted'"
+                >
+                  Khusus Mitra
+                  <p class="text-[11px] font-normal mt-0.5 opacity-80">Hanya tampil ke sekolah yang di-assign lewat "Paket Terpasang" di menu Mitra</p>
+                </button>
               </div>
             </div>
           </div>

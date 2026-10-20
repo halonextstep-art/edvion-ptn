@@ -120,7 +120,9 @@ pub struct Voucher {
     pub school_name: Option<String>,
     pub referrer_name: Option<String>,
     pub referrer_commission: Option<i32>,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context — see
+    // `postgres_voucher_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 

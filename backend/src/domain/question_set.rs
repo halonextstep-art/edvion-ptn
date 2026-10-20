@@ -12,7 +12,9 @@ pub struct QuestionSet {
     pub id: Uuid,
     pub name: String,
     pub description: String,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context — see
+    // `postgres_question_set_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Live `COUNT` of `question_set_items` rows for this set — never stored, computed at

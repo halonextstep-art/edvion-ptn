@@ -42,3 +42,5 @@ csv = "1"
 # infrastructure::docx_reader). Deflate-only — DOCX never uses bzip2/zstd/AES compression, so
 # the heavier default feature set is disabled to keep the dependency tree small.
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+aws-sdk-s3 = { version = "1.152.0", features = ["rustls"] }
+aws-config = { version = "1.12.0", features = ["rustls"] }

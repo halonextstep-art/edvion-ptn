@@ -100,9 +100,16 @@ pub struct SimulationTemplate {
     /// `SimulationService::start_run` time, and snapshotted onto `SimulationRun::lockdown_enabled`
     /// — never read live from here again once a run has started.
     pub lockdown_override: Option<bool>,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context — see
+    // `postgres_simulation_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub slots: Vec<SimulationTemplateSlot>,
+    /// `true` iff at least one student has a `simulation_runs` row against this template.
+    /// Surfaced to the admin edit form so it can disable the slot editor with an explanation
+    /// instead of silently discarding slot edits — see
+    /// `SimulationService::update_template` doc comment for why slots freeze once this is true.
+    pub has_runs: bool,
 }
 
 impl SimulationTemplate {

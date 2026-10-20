@@ -19,8 +19,7 @@ const {
   eventService,
   gamificationService,
   paymentService,
-  publicService,
-  entitlementService,
+  packageService,
 } = useApi()
 
 const attempts = ref<Attempt[]>([])
@@ -31,10 +30,6 @@ const badges = ref<StudentBadgeStatusItem[]>([])
 const transactions = ref<PaymentTransactionItem[]>([])
 const catalogPackages = ref<PackageItem[]>([])
 const loading = ref(true)
-// Fail closed (stays false) on error since this only gates whether we nag a student who
-// already has access to buy again — same fail-closed convention as DrillingZone.vue's
-// premium check.
-const hasPremiumAccess = ref(false)
 
 onMounted(async () => {
   const results = await Promise.allSettled([
@@ -44,8 +39,7 @@ onMounted(async () => {
     eventService.upcoming(3),
     gamificationService.myBadges(),
     paymentService.myTransactions(),
-    publicService.packages(),
-    entitlementService.myAccessStatus(),
+    packageService.catalog(),
   ])
   if (results[0].status === 'fulfilled') attempts.value = results[0].value
   if (results[1].status === 'fulfilled') targets.value = results[1].value
@@ -54,16 +48,18 @@ onMounted(async () => {
   if (results[4].status === 'fulfilled') badges.value = results[4].value
   if (results[5].status === 'fulfilled') transactions.value = results[5].value
   if (results[6].status === 'fulfilled') catalogPackages.value = results[6].value
-  if (results[7].status === 'fulfilled') hasPremiumAccess.value = results[7].value.has_premium_access
   loading.value = false
 })
 
 // The only "Beli Paket" entry point that previously existed was on the pre-login landing
 // page — a student already logged in (B2B or B2C) had no in-app way to buy a package.
-// Shown only when there's something to sell and the student doesn't already have premium
-// access, to avoid nagging students who are already covered (personal voucher or, for a
-// B2B student, their school's entitlement).
-const showPackageShowcase = computed(() => !hasPremiumAccess.value && catalogPackages.value.length > 0)
+// Shown whenever the catalog has anything to sell — previously this also hid the whole
+// section if `hasPremiumAccess` (owns ANY package at all), which incorrectly hid OTHER
+// unowned packages from a student who already owns one unrelated package. `catalogPackages`
+// itself (via `packageService.catalog()`) already excludes anything the student can't/shouldn't
+// see (restricted-visibility packages their school wasn't granted), so no extra gating is
+// needed here.
+const showPackageShowcase = computed(() => catalogPackages.value.length > 0)
 function buyPackage(pkg: PackageItem) {
   router.push(`/checkout?packageId=${pkg.id}`)
 }

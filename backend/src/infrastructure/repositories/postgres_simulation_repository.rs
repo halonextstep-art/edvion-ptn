@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use crate::domain::package::ExamTrack;
 use crate::domain::repository::{
-    LockdownViolationRepository, NewLockdownViolation, NewSimulationRun, NewSimulationTemplate,
-    SimulationRunRepository, SimulationTemplateRepository,
+    LockdownViolationRepository, NewLockdownViolation, NewSimulationRun, NewSimulationTemplate, SimulationRunRepository,
+    SimulationTemplateRepository, UpdateSimulationTemplate,
 };
 use crate::domain::school::SchoolType;
 use crate::domain::simulation::{
@@ -139,6 +139,10 @@ impl PostgresSimulationTemplateRepository {
 
     async fn assemble(&self, row: TemplateRow, tx: &mut Transaction<'static, Postgres>) -> AppResult<SimulationTemplate> {
         let slots = self.slots_for_template(row.internal_id, tx).await?;
+        let has_runs: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ptn.simulation_runs WHERE template_id = $1)")
+            .bind(row.internal_id)
+            .fetch_one(&mut **tx)
+            .await?;
         Ok(SimulationTemplate {
             id: row.public_id,
             title: row.title,
@@ -153,6 +157,7 @@ impl PostgresSimulationTemplateRepository {
             created_by: row.created_by,
             created_at: row.created_at,
             slots,
+            has_runs,
         })
     }
 }
@@ -168,7 +173,10 @@ struct TemplateRow {
     is_draft: bool,
     elective_package_id: Option<Uuid>,
     template_kind: String,
-    created_by: Uuid,
+    // `Option` because the scalar subquery can return NULL when `created_by` points at a
+    // `core.akun` row the current RLS context can't see — see
+    // `domain::simulation::SimulationTemplate::created_by` doc comment.
+    created_by: Option<Uuid>,
     created_at: DateTime<Utc>,
     exam_track: String,
     school_type_scope: Option<String>,
@@ -425,6 +433,103 @@ impl SimulationTemplateRepository for PostgresSimulationTemplateRepository {
             })?;
         tx.commit().await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn has_any_run(&self, id: Uuid, ctx: &TenantCtx) -> AppResult<bool> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let exists: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM ptn.simulation_runs r
+                 JOIN ptn.simulation_templates t ON t.id = r.template_id
+                 WHERE t.public_id = $1
+               )"#,
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(exists)
+    }
+
+    async fn update(&self, id: Uuid, input: UpdateSimulationTemplate, ctx: &TenantCtx) -> AppResult<Option<SimulationTemplate>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+
+        let template_id: Option<i64> = sqlx::query_scalar("SELECT id FROM ptn.simulation_templates WHERE public_id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(template_id) = template_id else {
+            tx.rollback().await.ok();
+            return Ok(None);
+        };
+
+        let elective_package_id: Option<i64> = match input.elective_package_id {
+            Some(pid) => Some(
+                sqlx::query_scalar("SELECT id FROM ptn.packages WHERE public_id = $1")
+                    .bind(pid)
+                    .fetch_one(&mut *tx)
+                    .await?,
+            ),
+            None => None,
+        };
+
+        sqlx::query(
+            r#"UPDATE ptn.simulation_templates SET
+                 title = $2, is_premium = $3, elective_package_id = $4, template_kind = $5,
+                 exam_track = $6, school_type_scope = $7, lockdown_override = $8
+               WHERE id = $1"#,
+        )
+        .bind(template_id)
+        .bind(&input.title)
+        .bind(input.is_premium)
+        .bind(elective_package_id)
+        .bind(template_kind_str(input.template_kind))
+        .bind(exam_track_str(input.exam_track))
+        .bind(school_type_scope_str(input.school_type_scope))
+        .bind(input.lockdown_override)
+        .execute(&mut *tx)
+        .await?;
+
+        // Only reached once the service layer has confirmed (via `has_any_run`) that no
+        // student run references this template yet — see `UpdateSimulationTemplate` doc
+        // comment. Replace-all is safe here precisely because nothing downstream points at
+        // the old slot rows.
+        if let Some(slots) = input.slots {
+            sqlx::query("DELETE FROM ptn.simulation_template_slots WHERE template_id = $1")
+                .bind(template_id)
+                .execute(&mut *tx)
+                .await?;
+            for slot in &slots {
+                let session_id: Option<i64> = match slot.session_id {
+                    Some(sid) => Some(
+                        sqlx::query_scalar("SELECT id FROM ptn.tryout_sessions WHERE public_id = $1")
+                            .bind(sid)
+                            .fetch_one(&mut *tx)
+                            .await?,
+                    ),
+                    None => None,
+                };
+                sqlx::query(
+                    r#"INSERT INTO ptn.simulation_template_slots (template_id, sequence_index, session_id, break_seconds, is_elective)
+                       VALUES ($1, $2, $3, $4, $5)"#,
+                )
+                .bind(template_id)
+                .bind(slot.sequence_index)
+                .bind(session_id)
+                .bind(slot.break_seconds)
+                .bind(slot.is_elective)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        let row = sqlx::query_as::<_, TemplateRow>(&format!("SELECT {TEMPLATE_COLUMNS} FROM ptn.simulation_templates t WHERE t.id = $1"))
+            .bind(template_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let result = self.assemble(row, &mut tx).await?;
+        tx.commit().await?;
+        Ok(Some(result))
     }
 }
 

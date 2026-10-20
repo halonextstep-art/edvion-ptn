@@ -112,7 +112,9 @@ pub struct Badge {
     pub condition_type: BadgeConditionType,
     pub condition_value: i32,
     pub active: bool,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context — see
+    // `postgres_gamification_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -211,7 +213,9 @@ pub struct Challenge {
     pub reward_points: i32,
     pub reward_badge: Option<String>,
     pub description: String,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context — see
+    // `postgres_gamification_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 

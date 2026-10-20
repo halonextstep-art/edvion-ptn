@@ -175,10 +175,13 @@ pub struct Question {
     pub review_note: Option<String>,
     pub reviewed_by: Option<Uuid>,
     pub reviewed_at: Option<DateTime<Utc>>,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context (e.g.
+    // a platform-wide catalog question created by an admin under a different tenant than
+    // the viewer, or a deleted account) — see `postgres_question_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     /// Denormalized author name, resolved from `users.name` at read time — lets the UI
-    /// show "dibuat oleh Sari Dewi" instead of a raw UUID.
-    pub created_by_name: String,
+    /// show "dibuat oleh Sari Dewi" instead of a raw UUID. `None` alongside `created_by`.
+    pub created_by_name: Option<String>,
     pub usage_count: i32,
     pub average_score: f64,
     pub time_limit: Option<i32>,
@@ -194,7 +197,7 @@ impl Question {
     }
 
     pub fn is_owned_by(&self, user_id: Uuid) -> bool {
-        self.created_by == user_id
+        self.created_by == Some(user_id)
     }
 }
 

@@ -33,7 +33,9 @@ pub struct QuestionSetResponse {
     pub id: Uuid,
     pub name: String,
     pub description: String,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible to the current viewer — see
+    // `domain::question_set::QuestionSet::created_by` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub item_count: i64,

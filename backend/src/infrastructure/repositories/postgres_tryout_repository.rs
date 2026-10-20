@@ -50,7 +50,11 @@ struct SessionRow {
     topic_filter: Option<String>,
     difficulty_filter: Option<String>,
     is_premium: bool,
-    created_by: Uuid,
+    // `Option` because the scalar subquery below returns NULL whenever `created_by` points
+    // at a `core.akun` row the current RLS context can't see (e.g. an admin under a
+    // different tenant who authored platform-wide catalog content) — not just for a
+    // genuinely deleted account. See `domain::tryout::TryoutSession::created_by` doc comment.
+    created_by: Option<Uuid>,
     created_at: DateTime<Utc>,
     question_set_id: Option<Uuid>,
     is_draft: bool,
@@ -368,7 +372,11 @@ impl TryFrom<AttemptRow> for Attempt {
             session_title: r.session_title,
             session_type: parse_session_type(&r.session_type)?,
             student_id: r.student_id,
-            status: if r.status == "submitted" { AttemptStatus::Submitted } else { AttemptStatus::InProgress },
+            status: match r.status.as_str() {
+                "submitted" => AttemptStatus::Submitted,
+                "abandoned" => AttemptStatus::Abandoned,
+                _ => AttemptStatus::InProgress,
+            },
             duration_minutes: r.duration_minutes,
             started_at: r.started_at,
             submitted_at: r.submitted_at,
@@ -587,6 +595,27 @@ impl AttemptRepository for PostgresAttemptRepository {
             .ok_or_else(|| AppError::NotFound(format!("attempt {attempt_id} not found")))?;
         tx.commit().await?;
         Attempt::try_from(row)
+    }
+
+    async fn force_abandon(&self, attempt_id: Uuid, ctx: &TenantCtx) -> AppResult<Option<Attempt>> {
+        let mut tx = begin_tx(&self.pool, ctx).await?;
+        let updated = sqlx::query(
+            "UPDATE ptn.attempts SET status = 'abandoned' WHERE public_id = $1 AND status = 'in_progress'",
+        )
+        .bind(attempt_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(None);
+        }
+        let row = sqlx::query_as::<_, AttemptRow>(&format!("{SELECT_ATTEMPT} WHERE a.public_id = $1"))
+            .bind(attempt_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let result = Attempt::try_from(row)?;
+        tx.commit().await?;
+        Ok(Some(result))
     }
 
     async fn grade_answer(&self, answer_id: Uuid, is_correct: bool, ctx: &TenantCtx) -> AppResult<()> {

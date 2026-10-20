@@ -24,6 +24,23 @@ pub enum ExamTrack {
     Tka,
 }
 
+/// Who sees a `Package` in the "Beli Paket" catalog (`PackageService::list_public` /
+/// `list_for_student`). `Public` (default, every pre-existing row) means every student sees
+/// it, same as the original all-packages-visible behavior. `Restricted` means it's only
+/// shown to a student whose school currently has an active
+/// `ptn.school_package_entitlements` row for this package — a B2C student (no school) or a
+/// student at a school without that entitlement never sees it at all. This is deliberately a
+/// *visibility* gate, separate from `AccessService`'s *access* gate (which governs whether an
+/// already-visible, already-"owned" package's content can actually be started) — a
+/// `Restricted` package a school hasn't been granted is invisible, not just locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum PackageVisibility {
+    Public,
+    Restricted,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub id: Uuid,
@@ -52,7 +69,9 @@ pub struct Package {
     pub accent_color: String,
     pub active: bool,
     pub sort_order: i32,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context — see
+    // `postgres_package_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `0` = no "mapel pilihan" restriction — every `TryoutSession` in this package (whether
@@ -63,6 +82,8 @@ pub struct Package {
     pub elective_pick_count: i32,
     /// See `ExamTrack` doc comment above.
     pub exam_track: ExamTrack,
+    /// See `PackageVisibility` doc comment above.
+    pub visibility: PackageVisibility,
 }
 
 impl Package {

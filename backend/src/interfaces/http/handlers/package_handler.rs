@@ -28,6 +28,23 @@ pub async fn list(State(state): State<AppState>, auth: AuthUser) -> AppResult<Js
     Ok(Json(packages.into_iter().map(Into::into).collect()))
 }
 
+/// Logged-in student's "Beli Paket" catalog — unlike `public_handler::public_packages` (the
+/// anonymous landing page), this also surfaces `Restricted`-visibility packages the student's
+/// school has been granted. See `PackageService::list_for_student` doc comment.
+pub async fn catalog(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<Vec<PackageResponse>>> {
+    auth.require_role(&[crate::domain::user::Role::Student])?;
+    let owned_ids = state.access_service.owned_package_ids(auth.user_id, &auth.tenant).await?;
+    let packages = state.package_service.list_for_student(&owned_ids).await?;
+    let mut responses = Vec::with_capacity(packages.len());
+    for p in packages {
+        let id = p.id;
+        let mut resp: PackageResponse = p.into();
+        resp.content_titles = state.package_service.public_content_titles(id).await.unwrap_or_default();
+        responses.push(resp);
+    }
+    Ok(Json(responses))
+}
+
 pub async fn get(
     State(state): State<AppState>,
     auth: AuthUser,

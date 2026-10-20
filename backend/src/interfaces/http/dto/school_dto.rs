@@ -3,8 +3,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::application::school_portal_service::{PtnDistributionItem, RecentActivityItem, SchoolOverview, StudentRosterStat};
+use crate::application::school_portal_service::{
+    InProgressActivityItem, InProgressActivityKind, PtnDistributionItem, RecentActivityItem, SchoolOverview,
+    StudentRosterStat,
+};
 use crate::domain::school::{School, SchoolStatus};
+use crate::error::AppError;
 
 #[derive(Debug, Serialize)]
 pub struct SchoolOverviewResponse {
@@ -81,6 +85,52 @@ impl From<RecentActivityItem> for RecentActivityItemResponse {
     }
 }
 
+/// "attempt" | "simulation_run" on the wire — see `InProgressActivityKind` doc comment.
+fn activity_kind_str(k: InProgressActivityKind) -> &'static str {
+    match k {
+        InProgressActivityKind::Attempt => "attempt",
+        InProgressActivityKind::SimulationRun => "simulation_run",
+    }
+}
+
+pub fn parse_activity_kind(s: &str) -> Result<InProgressActivityKind, AppError> {
+    match s {
+        "attempt" => Ok(InProgressActivityKind::Attempt),
+        "simulation_run" => Ok(InProgressActivityKind::SimulationRun),
+        other => Err(AppError::Validation(format!("tipe aktivitas tidak dikenal: {other}"))),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct InProgressActivityItemResponse {
+    pub kind: String,
+    pub ref_id: Uuid,
+    pub student_id: Uuid,
+    pub student_name: String,
+    pub title: String,
+    pub started_at: DateTime<Utc>,
+}
+
+impl From<InProgressActivityItem> for InProgressActivityItemResponse {
+    fn from(a: InProgressActivityItem) -> Self {
+        Self {
+            kind: activity_kind_str(a.kind).to_string(),
+            ref_id: a.ref_id,
+            student_id: a.student_id,
+            student_name: a.student_name,
+            title: a.title,
+            started_at: a.started_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Validate)]
+pub struct ForceAbandonActivityPayload {
+    /// "attempt" | "simulation_run" — see `InProgressActivityItemResponse.kind` doc comment
+    /// on the matching list item.
+    pub kind: String,
+}
+
 fn default_school_status() -> String {
     "active".to_string()
 }
@@ -115,6 +165,11 @@ pub struct SchoolPayload {
     /// Contracted plan value in Rupiah, admin-recorded.
     #[serde(default)]
     pub monthly_revenue: i64,
+    /// Create-only — adopts an existing `core.tenant.public_id` instead of creating a new
+    /// one. Ignored by `into_update_input` (a school's tenant link can't be changed after
+    /// creation). See `CreateSchoolInput::linked_tenant_id` doc comment.
+    #[serde(default)]
+    pub linked_tenant_id: Option<Uuid>,
 }
 
 impl SchoolPayload {
@@ -133,6 +188,7 @@ impl SchoolPayload {
             status: self.status.parse().map_err(crate::error::AppError::Validation)?,
             revenue_share: self.revenue_share,
             monthly_revenue: self.monthly_revenue,
+            linked_tenant_id: self.linked_tenant_id,
         })
     }
 
@@ -170,6 +226,7 @@ impl SchoolStatusPayload {
 pub struct SchoolResponse {
     pub id: Uuid,
     pub name: String,
+    pub slug: String,
     pub school_type: String,
     pub city: String,
     pub province: String,
@@ -189,6 +246,7 @@ impl From<School> for SchoolResponse {
         Self {
             id: s.id,
             name: s.name,
+            slug: s.slug,
             school_type: s.school_type.as_str().to_string(),
             city: s.city,
             province: s.province,

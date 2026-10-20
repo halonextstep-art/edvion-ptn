@@ -29,7 +29,10 @@ pub struct TryoutSession {
     pub topic_filter: Option<String>,
     pub difficulty_filter: Option<String>,
     pub is_premium: bool,
-    pub created_by: Uuid,
+    // `None` when the creating account isn't visible under the current RLS context (e.g.
+    // a platform-wide catalog session created by an admin under a different tenant than
+    // the viewer, or a deleted account) — see `postgres_tryout_repository.rs` doc comment.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     /// `Some(set_id)` opts this session into the fixed, curated "Set Soal" question list
     /// instead of the random-filter draw — see `domain::question_set` doc comment. `None`
@@ -63,6 +66,14 @@ pub struct TryoutSession {
 pub enum AttemptStatus {
     InProgress,
     Submitted,
+    /// Force-cleared by a School admin (see `SchoolPortalService::force_abandon_attempt`) when
+    /// a student's attempt is stuck — e.g. tab closed mid-exam with no way back to it. Lets the
+    /// student start a fresh attempt for the same session, since
+    /// `TryoutService::start_attempt_impl`'s resume-instead-of-duplicate guard only resumes an
+    /// `InProgress` attempt; once `Abandoned`, it's no longer eligible. Never set by the student
+    /// themselves — there is no self-service abandon for plain Attempts (unlike
+    /// `SimulationRunStatus::Abandoned`, which a student CAN set on their own stuck run).
+    Abandoned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,7 +7,7 @@
 // bersama Profil & Keluar (dulu cuma ada di header, yang di-collapse habis di mobile). v-model
 // mengikat langsung ke `activeTab` yang sama dipakai <Tabs> di sekolah.vue, jadi bottom nav
 // mobile & tab atas desktop selalu sinkron satu state.
-import { LayoutDashboard, Users, TrendingUp, FileText, MoreHorizontal, Target, ClipboardList, ListChecks, UserRound, LogOut, X } from 'lucide-vue-next'
+import { LayoutDashboard, Users, TrendingUp, FileText, MoreHorizontal, Target, ClipboardList, ListChecks, Radio, UserRound, LogOut, X } from 'lucide-vue-next'
 
 const props = defineProps<{ modelValue: string }>()
 const emit = defineEmits<{
@@ -26,6 +26,7 @@ const primaryItems = [
 ] as const
 
 const moreTabItems = [
+  { value: 'monitoring', label: 'Pemantauan Pengerjaan', icon: Radio },
   { value: 'snbp', label: 'Rasionalisasi SNBP', icon: Target },
   { value: 'snbt', label: 'Rekap SNBT', icon: ClipboardList },
   { value: 'tka', label: 'Rekap TKA', icon: ListChecks },

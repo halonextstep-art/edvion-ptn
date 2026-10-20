@@ -102,14 +102,21 @@ impl SimulationService {
         Self { templates, runs, sessions, tryout, access, elective, packages, platform_settings, violations }
     }
 
-    /// `Role::Content` may author templates too (the "Buat Paket + Subtes" wizard) — mirrors
-    /// `QuestionService::create`'s Admin/Content split.
-    pub async fn create_template(&self, actor: &AuthUser, input: CreateTemplateInput) -> AppResult<SimulationTemplate> {
-        actor.require_role(&[Role::Admin, Role::Content])?;
-        if input.slots.is_empty() {
+    /// Shared by `create_template` and `update_template` — validates sequence-index
+    /// contiguity, break_seconds, elective/session consistency, and (if any slot is
+    /// elective) that `elective_package_id` points at a real package whose
+    /// `elective_pick_count` matches the number of elective slots. Does not touch the DB
+    /// beyond looking up the referenced session/package.
+    async fn validate_slots(
+        &self,
+        actor: &AuthUser,
+        slots: &[CreateTemplateSlotInput],
+        elective_package_id: Option<Uuid>,
+    ) -> AppResult<()> {
+        if slots.is_empty() {
             return Err(AppError::Validation("minimal 1 subtes diperlukan".to_string()));
         }
-        let mut indices: Vec<i32> = input.slots.iter().map(|s| s.sequence_index).collect();
+        let mut indices: Vec<i32> = slots.iter().map(|s| s.sequence_index).collect();
         indices.sort_unstable();
         for (i, idx) in indices.iter().enumerate() {
             if *idx != (i as i32 + 1) {
@@ -118,8 +125,8 @@ impl SimulationService {
                 ));
             }
         }
-        let elective_slot_count = input.slots.iter().filter(|s| s.is_elective).count();
-        for slot in &input.slots {
+        let elective_slot_count = slots.iter().filter(|s| s.is_elective).count();
+        for slot in slots {
             if slot.break_seconds < 0 {
                 return Err(AppError::Validation("jeda tidak boleh negatif".to_string()));
             }
@@ -141,7 +148,7 @@ impl SimulationService {
             }
         }
         if elective_slot_count > 0 {
-            let package_id = input.elective_package_id.ok_or_else(|| {
+            let package_id = elective_package_id.ok_or_else(|| {
                 AppError::Validation(
                     "template dengan slot mapel pilihan wajib menentukan paket sumber pilihan (elective_package_id)"
                         .to_string(),
@@ -158,11 +165,19 @@ impl SimulationService {
                     pkg.name, pkg.elective_pick_count
                 )));
             }
-        } else if input.elective_package_id.is_some() {
+        } else if elective_package_id.is_some() {
             return Err(AppError::Validation(
                 "elective_package_id hanya berlaku jika ada slot mapel pilihan".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    /// `Role::Content` may author templates too (the "Buat Paket + Subtes" wizard) — mirrors
+    /// `QuestionService::create`'s Admin/Content split.
+    pub async fn create_template(&self, actor: &AuthUser, input: CreateTemplateInput) -> AppResult<SimulationTemplate> {
+        actor.require_role(&[Role::Admin, Role::Content])?;
+        self.validate_slots(actor, &input.slots, input.elective_package_id).await?;
         self.templates
             .create(NewSimulationTemplate {
                 title: input.title,
@@ -186,6 +201,66 @@ impl SimulationService {
                 lockdown_override: input.lockdown_override,
             }, &actor.tenant)
             .await
+    }
+
+    /// Full edit of an existing template. Non-structural fields (title, premium, jenjang,
+    /// jenis simulasi, elective package, lockdown override) can always be changed. The slot
+    /// list (`input.slots`) is only applied if the template has NO recorded `simulation_runs`
+    /// yet — once a student has a run against it, replacing slots would desync that run's
+    /// history from what the template now says it contains (no FK enforces this; it's a data-
+    /// integrity choice, not a DB constraint — see `UpdateSimulationTemplate` doc comment).
+    /// Admin-only: unlike `create_template`/`delete_template`, Content authors don't get an
+    /// edit path here — editing an already-published template is an admin-level decision.
+    pub async fn update_template(&self, actor: &AuthUser, id: Uuid, input: CreateTemplateInput) -> AppResult<SimulationTemplate> {
+        actor.require_role(&[Role::Admin])?;
+        let existing = self
+            .templates
+            .find_by_id(id, &actor.tenant)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("template {id} not found")))?;
+        let has_runs = self.templates.has_any_run(id, &actor.tenant).await?;
+
+        // With run history, the frontend's slot editor is disabled and never submits a
+        // meaningful `elective_package_id` either — keep both exactly as they already are
+        // rather than trusting whatever the request happens to carry in those fields.
+        let (slots, elective_package_id) = if has_runs {
+            (None, existing.elective_package_id)
+        } else {
+            self.validate_slots(actor, &input.slots, input.elective_package_id).await?;
+            (
+                Some(
+                    input
+                        .slots
+                        .into_iter()
+                        .map(|s| NewSimulationTemplateSlot {
+                            sequence_index: s.sequence_index,
+                            session_id: s.session_id,
+                            break_seconds: s.break_seconds,
+                            is_elective: s.is_elective,
+                        })
+                        .collect(),
+                ),
+                input.elective_package_id,
+            )
+        };
+
+        self.templates
+            .update(
+                id,
+                crate::domain::repository::UpdateSimulationTemplate {
+                    title: input.title,
+                    is_premium: input.is_premium,
+                    slots,
+                    elective_package_id,
+                    template_kind: input.template_kind,
+                    exam_track: input.exam_track,
+                    school_type_scope: input.school_type_scope,
+                    lockdown_override: input.lockdown_override,
+                },
+                &actor.tenant,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("template {id} not found")))
     }
 
     /// See `domain::simulation::SimulationTemplate::lockdown_override` doc comment. Pass `None`
@@ -218,7 +293,7 @@ impl SimulationService {
             Role::Admin => self.templates.list(false, &actor.tenant).await,
             Role::Content => {
                 let all = self.templates.list(false, &actor.tenant).await?;
-                Ok(all.into_iter().filter(|t| !t.is_draft || t.created_by == actor.user_id).collect())
+                Ok(all.into_iter().filter(|t| !t.is_draft || t.created_by == Some(actor.user_id)).collect())
             }
             Role::Student => {
                 let all = self.templates.list(true, &actor.tenant).await?;
@@ -271,7 +346,7 @@ impl SimulationService {
                 .find_by_id(id, &actor.tenant)
                 .await?
                 .ok_or_else(|| AppError::NotFound(format!("template {id} not found")))?;
-            if existing.created_by != actor.user_id {
+            if existing.created_by != Some(actor.user_id) {
                 return Err(AppError::Forbidden("Anda hanya bisa menghapus simulasi yang Anda buat sendiri".to_string()));
             }
         }

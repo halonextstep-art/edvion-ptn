@@ -309,7 +309,7 @@ impl TryoutService {
         actor.require_role(&[Role::Admin, Role::Content])?;
         if actor.role != Role::Admin {
             let existing = self.get_session(session_id, &actor.tenant).await?;
-            if existing.created_by != actor.user_id {
+            if existing.created_by != Some(actor.user_id) {
                 return Err(AppError::Forbidden("Anda hanya bisa mengubah sesi yang Anda buat sendiri".to_string()));
             }
         }
@@ -344,7 +344,7 @@ impl TryoutService {
         actor.require_role(&[Role::Admin, Role::Content])?;
         if actor.role != Role::Admin {
             let existing = self.get_session(session_id, &actor.tenant).await?;
-            if existing.created_by != actor.user_id {
+            if existing.created_by != Some(actor.user_id) {
                 return Err(AppError::Forbidden("Anda hanya bisa menghapus sesi yang Anda buat sendiri".to_string()));
             }
         }

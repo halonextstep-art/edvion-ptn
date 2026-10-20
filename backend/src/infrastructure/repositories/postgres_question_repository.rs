@@ -54,8 +54,11 @@ struct QuestionRow {
     review_note: Option<String>,
     reviewed_by_public_id: Option<Uuid>,
     reviewed_at: Option<DateTime<Utc>>,
-    created_by_public_id: Uuid,
-    created_by_name: String,
+    // Both `Option` because the scalar subqueries below can return NULL when `created_by`
+    // points at a `core.akun` row the current RLS context can't see — see
+    // `domain::question::Question::created_by` doc comment.
+    created_by_public_id: Option<Uuid>,
+    created_by_name: Option<String>,
     usage_count: i32,
     average_score: f64,
     time_limit: Option<i32>,

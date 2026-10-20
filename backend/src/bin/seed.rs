@@ -232,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
             .create(&admin_actor, CreateSchoolInput {
                 name: name.to_string(), school_type, city: city.to_string(), province: province.to_string(),
                 email: email.to_string(), phone: phone.to_string(), package_type, contact_person: contact_person.to_string(),
-                status: SchoolStatus::Active, revenue_share, monthly_revenue: 0,
+                status: SchoolStatus::Active, revenue_share, monthly_revenue: 0, linked_tenant_id: None,
             })
             .await
         {
@@ -788,6 +788,7 @@ async fn main() -> anyhow::Result<()> {
                 accent_color: accent_color.to_string(), active, sort_order,
                 elective_pick_count: 0,
                 exam_track: ExamTrack::Snbt,
+                visibility: edvionptn_backend::domain::package::PackageVisibility::Public,
             })
             .await
         {

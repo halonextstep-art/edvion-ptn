@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {
   LogOut, LayoutDashboard, Users, TrendingUp, FileText, School, Target,
-  ClipboardList, ListChecks,
+  ClipboardList, ListChecks, Radio,
 } from 'lucide-vue-next'
 
 definePageMeta({ middleware: 'auth', roles: ['school'] })
@@ -56,6 +56,9 @@ const initials = computed(() => (user.value?.name || '?').trim().charAt(0).toUpp
           <TabsTrigger value="students" class="gap-2">
             <Users class="w-4 h-4" /><span class="hidden sm:inline">Siswa</span>
           </TabsTrigger>
+          <TabsTrigger value="monitoring" class="gap-2">
+            <Radio class="w-4 h-4" /><span class="hidden sm:inline">Pemantauan</span>
+          </TabsTrigger>
           <TabsTrigger value="snbp" class="gap-2">
             <Target class="w-4 h-4" /><span class="hidden sm:inline">Rasionalisasi SNBP</span>
           </TabsTrigger>
@@ -76,6 +79,7 @@ const initials = computed(() => (user.value?.name || '?').trim().charAt(0).toUpp
         <TabsContent value="overview"><SchoolOverview @navigate="activeTab = $event" /></TabsContent>
 
         <TabsContent value="students"><StudentManager /></TabsContent>
+        <TabsContent value="monitoring"><SchoolMonitoring /></TabsContent>
         <TabsContent value="snbp"><SchoolRasionalisasi /></TabsContent>
         <TabsContent value="snbt"><SchoolRekapSnbt /></TabsContent>
         <TabsContent value="tka"><SchoolRekapTka /></TabsContent>

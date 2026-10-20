@@ -27,10 +27,27 @@ const search = ref('')
 const filterStatus = ref<UserStatus | ''>('')
 const filterGrade = ref('')
 
+// `UserService.list` is paginated server-side (max 100/page — see backend
+// `UserListResponse`). The backend already scopes a School actor's call to just their own
+// roster (no `school_id`/`role` filter needed client-side — see module doc comment above),
+// so this only ever pages through ONE school's students, not the whole platform — bounded
+// and cheap, unlike the admin cross-school case this same pattern was first built for.
+async function fetchAllStudents(): Promise<User[]> {
+  const pageSize = 100
+  const first = await userService.list({ page: 1, page_size: pageSize })
+  const all = [...first.items]
+  const totalPages = Math.ceil(first.total / pageSize)
+  for (let p = 2; p <= totalPages; p++) {
+    const res = await userService.list({ page: p, page_size: pageSize })
+    all.push(...res.items)
+  }
+  return all
+}
+
 async function load() {
   loading.value = true
   try {
-    const [s, st] = await Promise.all([userService.list(), schoolService.rosterStats()])
+    const [s, st] = await Promise.all([fetchAllStudents(), schoolService.rosterStats()])
     students.value = s
     stats.value = st
   } catch (e: any) {

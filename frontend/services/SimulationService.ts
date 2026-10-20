@@ -20,6 +20,12 @@ export class SimulationService {
     return this.api.post<SimulationTemplateItem>('/simulations/templates', payload)
   }
 
+  /** Full edit of an existing template — see `SimulationService::update_template` (backend)
+   *  doc comment for the "slots are frozen once a student has a run" rule. */
+  updateTemplate(id: string, payload: SimulationTemplatePayload) {
+    return this.api.put<SimulationTemplateItem>(`/simulations/templates/${id}`, payload)
+  }
+
   setTemplateActive(id: string, active: boolean) {
     return this.api.patch<SimulationTemplateItem>(`/simulations/templates/${id}/active`, { active })
   }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::domain::package::{ExamTrack, Package, PackageContentItem, PackageContentType};
+use crate::domain::package::{ExamTrack, Package, PackageContentItem, PackageContentType, PackageVisibility};
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct PackagePayload {
@@ -47,6 +47,11 @@ pub struct PackagePayload {
     /// See `domain::package::ExamTrack` doc comment.
     #[serde(default = "default_exam_track")]
     pub exam_track: ExamTrack,
+    /// See `domain::package::PackageVisibility` doc comment. Defaults to `Public` — every
+    /// pre-existing package and every package created without explicitly opting into
+    /// `restricted` keeps today's "visible to everyone" behavior.
+    #[serde(default = "default_visibility")]
+    pub visibility: PackageVisibility,
 }
 
 fn default_type() -> String {
@@ -76,6 +81,9 @@ fn default_true() -> bool {
 fn default_exam_track() -> ExamTrack {
     ExamTrack::Snbt
 }
+fn default_visibility() -> PackageVisibility {
+    PackageVisibility::Public
+}
 
 impl PackagePayload {
     pub fn into_create_input(self) -> crate::application::package_service::CreatePackageInput {
@@ -98,6 +106,7 @@ impl PackagePayload {
             sort_order: self.sort_order,
             elective_pick_count: self.elective_pick_count,
             exam_track: self.exam_track,
+            visibility: self.visibility,
         }
     }
 
@@ -121,6 +130,7 @@ impl PackagePayload {
             sort_order: self.sort_order,
             elective_pick_count: self.elective_pick_count,
             exam_track: self.exam_track,
+            visibility: self.visibility,
         }
     }
 }
@@ -155,6 +165,8 @@ pub struct PackageResponse {
     pub elective_pick_count: i32,
     /// See `domain::package::ExamTrack` doc comment.
     pub exam_track: ExamTrack,
+    /// See `domain::package::PackageVisibility` doc comment.
+    pub visibility: PackageVisibility,
     /// Always 0 — no purchase/checkout system exists in this codebase yet, so there is
     /// no real sales figure to report. Kept as an explicit field (rather than omitted)
     /// so the admin UI can show "belum ada data penjualan" instead of guessing.
@@ -246,6 +258,7 @@ impl From<Package> for PackageResponse {
             sort_order: p.sort_order,
             elective_pick_count: p.elective_pick_count,
             exam_track: p.exam_track,
+            visibility: p.visibility,
             sold_count: 0,
             content_titles: Vec::new(),
             created_at: p.created_at,

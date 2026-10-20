@@ -37,7 +37,10 @@ struct AdmissionDeadlineRow {
     label: String,
     description: String,
     deadline_date: NaiveDate,
-    created_by: Uuid,
+    // `Option` because the scalar subquery can return NULL when `created_by` points at a
+    // `core.akun` row the current RLS context can't see — see
+    // `domain::admission_deadline::AdmissionDeadline::created_by` doc comment.
+    created_by: Option<Uuid>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }

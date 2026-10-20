@@ -67,13 +67,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/roster-stats", get(school_handler::roster_stats))
         .route("/ptn-distribution", get(school_handler::ptn_distribution))
         .route("/recent-activity", get(school_handler::recent_activity))
+        .route("/in-progress-activity", get(school_handler::in_progress_activity))
+        .route("/in-progress-activity/:ref_id/abandon", post(school_handler::force_abandon_activity))
+        // Must come before `/:id` so it isn't swallowed by the path param (same reasoning
+        // as `institution_routes`'s `/lookup` above).
+        .route("/unlinked-tenants", get(school_handler::unlinked_tenants))
+        .route("/roster-counts", get(school_handler::roster_counts))
         .route(
             "/:id",
             get(school_handler::get)
                 .put(school_handler::update)
                 .delete(school_handler::delete),
         )
-        .route("/:id/status", patch(school_handler::set_status));
+        .route("/:id/status", patch(school_handler::set_status))
+        .route(
+            "/:id/linkable-students",
+            get(school_handler::linkable_students).post(school_handler::link_students),
+        );
 
     let user_routes = Router::new()
         .route("/", get(user_handler::list).post(user_handler::create))
@@ -119,6 +129,9 @@ pub fn build_router(state: AppState) -> Router {
 
     let package_routes = Router::new()
         .route("/", get(package_handler::list).post(package_handler::create))
+        // Logged-in student's catalog — see `package_handler::catalog` doc comment. Registered
+        // before `/:id` so it never collides with the path-param route.
+        .route("/catalog", get(package_handler::catalog))
         .route(
             "/:id",
             get(package_handler::get)
@@ -366,7 +379,10 @@ pub fn build_router(state: AppState) -> Router {
         // Per-template "Mode Terkunci" override — see
         // `domain::simulation::SimulationTemplate::lockdown_override` doc comment.
         .route("/templates/:id/lockdown", patch(simulation_handler::set_template_lockdown))
-        .route("/templates/:id", axum::routing::delete(simulation_handler::delete_template))
+        .route(
+            "/templates/:id",
+            put(simulation_handler::update_template).delete(simulation_handler::delete_template),
+        )
         // Aggregate-only benchmark for the sertifikat/laporan PDF — see
         // `SimulationService::template_stats` doc comment.
         .route("/templates/:id/stats", get(simulation_handler::template_stats))

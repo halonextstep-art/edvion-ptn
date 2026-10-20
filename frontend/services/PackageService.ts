@@ -12,6 +12,14 @@ export class PackageService {
     return this.api.get<PackageItem>(`/packages/${id}`)
   }
 
+  /** Logged-in student's "Beli Paket" catalog — unlike the anonymous landing page's
+   *  `publicService.packages()`, this also includes `restricted`-visibility packages the
+   *  student's school has been granted (or they personally hold a voucher for). See backend
+   *  `package_handler::catalog` doc comment. */
+  catalog() {
+    return this.api.get<PackageItem[]>('/packages/catalog')
+  }
+
   create(payload: PackagePayload) {
     return this.api.post<PackageItem>('/packages', payload)
   }

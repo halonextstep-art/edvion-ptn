@@ -357,7 +357,7 @@ function onImported() {
                 </div>
                 <p class="text-sm text-slate-800 dark:text-white/80 line-clamp-2">{{ q.question_text }}</p>
                 <div class="flex items-center gap-3 mt-1 flex-wrap">
-                  <p class="text-xs text-muted-foreground flex items-center gap-1"><User class="w-3 h-3" />{{ q.created_by_name }}</p>
+                  <p class="text-xs text-muted-foreground flex items-center gap-1"><User class="w-3 h-3" />{{ q.created_by_name || '—' }}</p>
                   <p v-if="q.usage_count > 0" class="text-xs text-muted-foreground flex items-center gap-1"><BarChart3 class="w-3 h-3" />{{ q.usage_count }}x dipakai</p>
                 </div>
                 <p v-if="q.review_note" class="text-xs mt-1 flex items-start gap-1" :class="q.status === 'rejected' ? 'text-red-500 dark:text-red-400' : 'text-blue-500 dark:text-blue-400'">

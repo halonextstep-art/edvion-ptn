@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         attempt_repo.clone(),
         ptn_target_repo.clone(),
         ptn_program_repo.clone(),
+        simulation_run_repo.clone(),
     ));
     let access_service = Arc::new(AccessService::new(
         entitlement_repo,

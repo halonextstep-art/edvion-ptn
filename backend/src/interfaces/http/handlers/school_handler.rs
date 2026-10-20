@@ -8,8 +8,9 @@ use validator::Validate;
 
 use crate::error::{AppError, AppResult};
 use crate::interfaces::http::dto::school_dto::{
-    PtnDistributionItemResponse, RecentActivityItemResponse, SchoolOverviewResponse, SchoolPayload, SchoolResponse,
-    SchoolStatusPayload, StudentRosterStatResponse,
+    parse_activity_kind, ForceAbandonActivityPayload, InProgressActivityItemResponse, PtnDistributionItemResponse,
+    RecentActivityItemResponse, SchoolOverviewResponse, SchoolPayload, SchoolResponse, SchoolStatusPayload,
+    StudentRosterStatResponse,
 };
 use crate::interfaces::http::middleware::AuthUser;
 use crate::interfaces::http::state::AppState;
@@ -53,6 +54,31 @@ pub async fn recent_activity(
     Ok(Json(data.into_iter().map(Into::into).collect()))
 }
 
+/// School-portal-only live feed — "Pemantauan Pengerjaan": every in-progress Attempt and
+/// SimulationRun across the school's roster. The frontend polls this on an interval (no
+/// realtime push infra in this codebase — see `InProgressActivityItem` doc comment).
+pub async fn in_progress_activity(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> AppResult<Json<Vec<InProgressActivityItemResponse>>> {
+    let data = state.school_portal_service.in_progress_activity(&auth).await?;
+    Ok(Json(data.into_iter().map(Into::into).collect()))
+}
+
+/// School-portal-only write — force-clears one student's stuck in-progress activity so they
+/// can start a fresh attempt/run. See `SchoolPortalService::force_abandon_activity` doc
+/// comment.
+pub async fn force_abandon_activity(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(ref_id): Path<Uuid>,
+    Json(payload): Json<ForceAbandonActivityPayload>,
+) -> AppResult<Json<serde_json::Value>> {
+    let kind = parse_activity_kind(&payload.kind)?;
+    state.school_portal_service.force_abandon_activity(&auth, kind, ref_id).await?;
+    Ok(Json(serde_json::json!({ "abandoned": true })))
+}
+
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -67,6 +93,52 @@ pub async fn create(
 pub async fn list(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<Vec<SchoolResponse>>> {
     let schools = state.school_service.list(&auth).await?;
     Ok(Json(schools.into_iter().map(Into::into).collect()))
+}
+
+/// Per-school student counts for the admin list cards — see `SchoolService::roster_counts`.
+pub async fn roster_counts(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> AppResult<Json<Vec<crate::domain::school::SchoolRosterCount>>> {
+    let counts = state.school_service.roster_counts(&auth).await?;
+    Ok(Json(counts))
+}
+
+/// "Link ke Tenant Existing" dropdown's data source — see `SchoolService::list_unlinked_tenants`.
+pub async fn unlinked_tenants(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> AppResult<Json<Vec<crate::domain::school::LinkableTenant>>> {
+    let tenants = state.school_service.list_unlinked_tenants(&auth).await?;
+    Ok(Json(tenants))
+}
+
+/// Import-siswa checklist's data source for a linked-tenant school — see
+/// `SchoolService::list_linkable_students`.
+pub async fn linkable_students(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<crate::domain::school::LinkableStudent>>> {
+    let students = state.school_service.list_linkable_students(&auth, id).await?;
+    Ok(Json(students))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LinkStudentsPayload {
+    pub akun_ids: Vec<Uuid>,
+}
+
+/// Submits the import-siswa checklist for a linked-tenant school — see
+/// `SchoolService::link_existing_students`.
+pub async fn link_students(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<LinkStudentsPayload>,
+) -> AppResult<Json<serde_json::Value>> {
+    let linked = state.school_service.link_existing_students(&auth, id, payload.akun_ids).await?;
+    Ok(Json(serde_json::json!({ "linked": linked })))
 }
 
 pub async fn get(

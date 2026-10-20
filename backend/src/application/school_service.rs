@@ -24,6 +24,8 @@ pub struct CreateSchoolInput {
     pub status: SchoolStatus,
     pub revenue_share: i32,
     pub monthly_revenue: i64,
+    /// See `NewSchool::linked_tenant_id` doc comment.
+    pub linked_tenant_id: Option<Uuid>,
 }
 
 pub struct UpdateSchoolInput {
@@ -66,6 +68,7 @@ impl SchoolService {
                 status: input.status,
                 revenue_share,
                 monthly_revenue: input.monthly_revenue.max(0),
+                linked_tenant_id: input.linked_tenant_id,
             })
             .await
     }
@@ -73,6 +76,34 @@ impl SchoolService {
     pub async fn list(&self, actor: &AuthUser) -> AppResult<Vec<School>> {
         actor.require_role(&[Role::Admin])?;
         self.schools.list().await
+    }
+
+    /// Per-school student counts for the "Manajemen Sekolah" list cards — see
+    /// `SchoolRepository::roster_counts` doc comment.
+    pub async fn roster_counts(&self, actor: &AuthUser) -> AppResult<Vec<crate::domain::school::SchoolRosterCount>> {
+        actor.require_role(&[Role::Admin])?;
+        self.schools.roster_counts().await
+    }
+
+    /// Data source for the "Link ke Tenant Existing" dropdown on school creation.
+    pub async fn list_unlinked_tenants(&self, actor: &AuthUser) -> AppResult<Vec<crate::domain::school::LinkableTenant>> {
+        actor.require_role(&[Role::Admin])?;
+        self.schools.list_unlinked_tenants().await
+    }
+
+    /// For a linked-tenant school's import-siswa step: existing `core.akun` (role SISWA)
+    /// at its tenant with no `ptn.student_profile` yet.
+    pub async fn list_linkable_students(&self, actor: &AuthUser, school_id: Uuid) -> AppResult<Vec<crate::domain::school::LinkableStudent>> {
+        actor.require_role(&[Role::Admin])?;
+        self.schools.list_linkable_students(school_id).await
+    }
+
+    /// Grants PTN access to the checked existing students — see
+    /// `SchoolRepository::link_existing_students` doc comment. Returns how many were
+    /// actually newly linked (already-linked/non-SISWA ids are silently skipped).
+    pub async fn link_existing_students(&self, actor: &AuthUser, school_id: Uuid, akun_ids: Vec<Uuid>) -> AppResult<i64> {
+        actor.require_role(&[Role::Admin])?;
+        self.schools.link_existing_students(school_id, &akun_ids).await
     }
 
     pub async fn get(&self, actor: &AuthUser, id: Uuid) -> AppResult<School> {

@@ -119,8 +119,12 @@ impl AccessService {
     /// Every `package_id` this student owns — via a personally-redeemed voucher OR (if they
     /// belong to a school) their school's active entitlement. This is the raw ownership
     /// signal; whether a given package actually includes the specific content the student
-    /// wants is answered separately by `has_access_to_content`.
-    async fn owned_package_ids(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<HashSet<Uuid>> {
+    /// wants is answered separately by `has_access_to_content`. Also reused by
+    /// `PackageService::list_for_student` as the set of `Restricted`-visibility packages this
+    /// student is allowed to even SEE in the catalog — see `domain::package::PackageVisibility`
+    /// doc comment for why visibility and access are deliberately separate gates that happen
+    /// to share the same underlying "owned" signal.
+    pub async fn owned_package_ids(&self, student_id: Uuid, ctx: &TenantCtx) -> AppResult<HashSet<Uuid>> {
         let mut ids: HashSet<Uuid> = self.vouchers.student_redeemed_package_ids(student_id, ctx).await?.into_iter().collect();
         if let Some(user) = self.users.find_by_id(student_id, ctx).await? {
             if let Some(school_id) = user.school_id {

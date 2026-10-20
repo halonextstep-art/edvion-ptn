@@ -24,6 +24,17 @@ pub async fn create_template(
     Ok(Json(template.into()))
 }
 
+pub async fn update_template(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<CreateTemplatePayload>,
+) -> AppResult<Json<SimulationTemplateResponse>> {
+    payload.validate().map_err(|e| AppError::Validation(e.to_string()))?;
+    let template = state.simulation_service.update_template(&auth, id, payload.into_input()).await?;
+    Ok(Json(template.into()))
+}
+
 pub async fn list_templates(
     State(state): State<AppState>,
     auth: AuthUser,

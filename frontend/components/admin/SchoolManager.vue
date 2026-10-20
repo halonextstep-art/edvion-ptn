@@ -1,12 +1,17 @@
 <script setup lang="ts">
 import { Search, Pencil, Trash2, Plus, School as SchoolIcon, CheckCircle2, Clock, XCircle, Users as UsersIcon, DollarSign, UserPlus, Upload, Eye, X, Award, Tag, AlertTriangle, GraduationCap } from 'lucide-vue-next'
-import type { PackageType, School, SchoolStatus, User, PackageItem, SchoolEntitlementItem } from '~/types'
+import type { PackageType, School, SchoolStatus, User, PackageItem, SchoolEntitlementItem, SchoolRosterCount } from '~/types'
 
 const { schoolService, userService, analyticsService, packageService, entitlementService } = useApi()
 const toast = useToast()
 
 const schools = ref<School[]>([])
-const students = ref<User[]>([])
+// Per-school student/active-student counts — one aggregate query (`GET
+// /schools/roster-counts`), not every student row across every school (which used to mean
+// either shipping the whole `core.akun` table to the browser, or — after pagination was
+// added — 70+ sequential page requests just to `.length` them client-side). See
+// backend `SchoolRepository::roster_counts` doc comment.
+const rosterCounts = ref<SchoolRosterCount[]>([])
 const rankings = ref<{ school_id: string; average_score: number }[]>([])
 const loading = ref(false)
 const search = ref('')
@@ -18,6 +23,10 @@ const editTarget = ref<School | null>(null)
 const showDelete = ref(false)
 const deleteTarget = ref<School | null>(null)
 const detailSchool = ref<School | null>(null)
+// The detail drawer's actual student list — fetched on demand for the ONE school being
+// viewed, not pre-loaded for every school up front.
+const detailStudents = ref<User[]>([])
+const detailStudentsLoading = ref(false)
 
 const showWizard = ref(false)
 const wizardSchool = ref<School | null>(null)
@@ -50,46 +59,33 @@ const stats = computed(() => ({
   total: schools.value.length,
   active: schools.value.filter((s) => s.status === 'active').length,
   pending: schools.value.filter((s) => s.status === 'pending').length,
-  totalStudents: students.value.length,
+  totalStudents: rosterCounts.value.reduce((sum, r) => sum + r.total_students, 0),
   revenue: schools.value.reduce((sum, s) => sum + Math.round((s.monthly_revenue * s.revenue_share) / 100), 0),
 }))
 
-function studentsOf(schoolId: string) {
-  return students.value.filter((u) => u.school_id === schoolId)
+function rosterCountOf(schoolId: string) {
+  return rosterCounts.value.find((r) => r.school_id === schoolId)
+}
+function totalStudentsOf(schoolId: string) {
+  return rosterCountOf(schoolId)?.total_students ?? 0
 }
 function activeStudentsOf(schoolId: string) {
-  return studentsOf(schoolId).filter((u) => u.status === 'active').length
+  return rosterCountOf(schoolId)?.active_students ?? 0
 }
 function avgScoreOf(schoolId: string) {
   return rankings.value.find((r) => r.school_id === schoolId)?.average_score
 }
 
-// `UserService.list` is paginated server-side (max 100/page — see backend
-// `UserListResponse`), but this screen genuinely needs every B2B student across every
-// school at once (per-school roster counts + the full student list in the detail
-// drawer), so page through the whole result set once on load.
-async function fetchAllStudents(): Promise<User[]> {
-  const pageSize = 100
-  const first = await userService.list({ role: 'student', has_school: true, page: 1, page_size: pageSize })
-  const all = [...first.items]
-  const totalPages = Math.ceil(first.total / pageSize)
-  for (let p = 2; p <= totalPages; p++) {
-    const res = await userService.list({ role: 'student', has_school: true, page: p, page_size: pageSize })
-    all.push(...res.items)
-  }
-  return all
-}
-
 async function load() {
   loading.value = true
   try {
-    const [sc, us, top] = await Promise.all([
+    const [sc, counts, top] = await Promise.all([
       schoolService.list(),
-      fetchAllStudents(),
+      schoolService.rosterCounts(),
       analyticsService.topSchools(50),
     ])
     schools.value = sc
-    students.value = us
+    rosterCounts.value = counts
     rankings.value = top
   } catch (e: any) {
     toast.error('Gagal memuat daftar sekolah', e?.message)
@@ -98,6 +94,23 @@ async function load() {
   }
 }
 onMounted(load)
+
+// Fetches the ONE selected school's students on demand, for the detail drawer — see
+// `detailStudents` doc comment. `has_school`/`role` narrow the filter but the real scoping
+// is `school_id`, which the backend already supports as a dedicated indexed filter.
+watch(detailSchool, async (s) => {
+  detailStudents.value = []
+  if (!s) return
+  detailStudentsLoading.value = true
+  try {
+    const res = await userService.list({ role: 'student', school_id: s.id, page_size: 100 })
+    detailStudents.value = res.items
+  } catch (e: any) {
+    toast.error('Gagal memuat siswa sekolah ini', e?.message)
+  } finally {
+    detailStudentsLoading.value = false
+  }
+})
 
 function openCreate() {
   editTarget.value = null
@@ -353,7 +366,7 @@ async function removeEntitlement(item: SchoolEntitlementItem) {
 
         <div class="grid grid-cols-3 gap-2 mb-4">
           <div class="p-2.5 bg-slate-50 rounded-lg text-center">
-            <p class="font-bold text-sm text-slate-900">{{ studentsOf(s.id).length }}</p>
+            <p class="font-bold text-sm text-slate-900">{{ totalStudentsOf(s.id) }}</p>
             <p class="text-[10px] text-muted-foreground mt-0.5">Total Siswa</p>
           </div>
           <div class="p-2.5 bg-slate-50 rounded-lg text-center">
@@ -366,7 +379,7 @@ async function removeEntitlement(item: SchoolEntitlementItem) {
           </div>
         </div>
 
-        <div v-if="s.status === 'active' && studentsOf(s.id).length === 0" class="flex items-center gap-2 p-2.5 bg-indigo-50 border border-indigo-200 rounded-lg mb-3">
+        <div v-if="s.status === 'active' && totalStudentsOf(s.id) === 0" class="flex items-center gap-2 p-2.5 bg-indigo-50 border border-indigo-200 rounded-lg mb-3">
           <UserPlus class="w-4 h-4 text-indigo-600 shrink-0" />
           <p class="text-xs text-indigo-800 font-medium flex-1">Belum ada siswa diimport</p>
           <button class="text-xs text-indigo-600 font-bold underline" @click="openWizard(s, 'import')">Import Sekarang</button>
@@ -449,7 +462,7 @@ async function removeEntitlement(item: SchoolEntitlementItem) {
             <div class="grid grid-cols-3 gap-3 mb-5">
               <div class="bg-slate-50 rounded-xl p-3">
                 <UsersIcon class="w-4 h-4 text-blue-500 mb-1.5" />
-                <p class="text-lg font-black text-slate-900">{{ studentsOf(detailSchool.id).length }}</p>
+                <p class="text-lg font-black text-slate-900">{{ totalStudentsOf(detailSchool.id) }}</p>
                 <p class="text-[10px] text-muted-foreground">Total Siswa</p>
               </div>
               <div class="bg-slate-50 rounded-xl p-3">
@@ -535,19 +548,23 @@ async function removeEntitlement(item: SchoolEntitlementItem) {
             </div>
 
             <div class="mb-5">
-              <h5 class="text-xs font-bold text-slate-700 uppercase tracking-wide mb-2.5 flex items-center gap-1.5"><GraduationCap class="w-3.5 h-3.5 text-indigo-500" />Daftar Siswa ({{ studentsOf(detailSchool.id).length }})</h5>
-              <div v-if="studentsOf(detailSchool.id).length === 0" class="text-center text-xs text-muted-foreground py-3 border border-dashed rounded-lg">
+              <h5 class="text-xs font-bold text-slate-700 uppercase tracking-wide mb-2.5 flex items-center gap-1.5"><GraduationCap class="w-3.5 h-3.5 text-indigo-500" />Daftar Siswa ({{ totalStudentsOf(detailSchool.id) }})</h5>
+              <div v-if="detailStudentsLoading" class="text-center text-xs text-muted-foreground py-3">Memuat...</div>
+              <div v-else-if="detailStudents.length === 0" class="text-center text-xs text-muted-foreground py-3 border border-dashed rounded-lg">
                 Belum ada siswa terdaftar di sekolah ini.
               </div>
               <div v-else class="space-y-1.5 max-h-56 overflow-y-auto pr-1">
-                <div v-for="u in studentsOf(detailSchool.id)" :key="u.id" class="flex items-center justify-between gap-2 p-2 border rounded-lg">
+                <div v-for="u in detailStudents" :key="u.id" class="flex items-center justify-between gap-2 p-2 border rounded-lg">
                   <div class="min-w-0">
-                    <p class="text-xs font-semibold text-slate-800 truncate">{{ u.name }}</p>
-                    <p class="text-[10px] text-muted-foreground truncate">{{ u.email }}{{ u.grade ? ` · ${u.grade}` : '' }}</p>
+                    <p class="text-xs font-semibold text-slate-800 truncate">{{ u.name || '(tanpa nama)' }}</p>
+                    <p class="text-[10px] text-muted-foreground truncate">{{ u.email || u.username || '—' }}{{ u.grade ? ` · ${u.grade}` : '' }}</p>
                   </div>
                   <Badge :variant="u.status === 'active' ? 'success' : 'secondary'" class="text-[10px] shrink-0">{{ u.status === 'active' ? 'Aktif' : u.status }}</Badge>
                 </div>
               </div>
+              <p v-if="!detailStudentsLoading && totalStudentsOf(detailSchool.id) > detailStudents.length" class="text-[10px] text-muted-foreground mt-1.5">
+                Menampilkan {{ detailStudents.length }} dari {{ totalStudentsOf(detailSchool.id) }} siswa (100 pertama).
+              </p>
             </div>
 
             <div class="flex flex-col gap-2">

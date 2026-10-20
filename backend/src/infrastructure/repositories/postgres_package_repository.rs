@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::domain::package::{ExamTrack, Package};
+use crate::domain::package::{ExamTrack, Package, PackageVisibility};
 use crate::domain::repository::{NewPackage, PackageRepository, PackageUpdate};
 use crate::domain::tenant::TenantCtx;
 use crate::error::{AppError, AppResult};
@@ -46,6 +46,21 @@ fn parse_exam_track(s: &str) -> AppResult<ExamTrack> {
     }
 }
 
+fn visibility_str(v: PackageVisibility) -> &'static str {
+    match v {
+        PackageVisibility::Public => "public",
+        PackageVisibility::Restricted => "restricted",
+    }
+}
+
+fn parse_visibility(s: &str) -> AppResult<PackageVisibility> {
+    match s {
+        "public" => Ok(PackageVisibility::Public),
+        "restricted" => Ok(PackageVisibility::Restricted),
+        other => Err(AppError::Internal(anyhow::anyhow!("corrupt package visibility: {other}"))),
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct PackageRow {
     public_id: Uuid,
@@ -65,11 +80,15 @@ struct PackageRow {
     accent_color: String,
     active: bool,
     sort_order: i32,
-    created_by_public_id: Uuid,
+    // `Option` because the scalar subquery can return NULL when `created_by` points at a
+    // `core.akun` row the current RLS context can't see — see
+    // `domain::package::Package::created_by` doc comment.
+    created_by_public_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     elective_pick_count: i32,
     exam_track: String,
+    visibility: String,
 }
 
 impl TryFrom<PackageRow> for Package {
@@ -98,6 +117,7 @@ impl TryFrom<PackageRow> for Package {
             updated_at: r.updated_at,
             elective_pick_count: r.elective_pick_count,
             exam_track: parse_exam_track(&r.exam_track)?,
+            visibility: parse_visibility(&r.visibility)?,
         })
     }
 }
@@ -107,7 +127,7 @@ const SELECT_PACKAGE: &str = r#"
            badge, emoji, icon_type, icon_name, icon_url, banner_url, gradient, accent_color, active,
            sort_order,
            (SELECT public_id FROM core.akun WHERE core.akun.id = ptn.packages.created_by) AS created_by_public_id,
-           created_at, updated_at, elective_pick_count, exam_track
+           created_at, updated_at, elective_pick_count, exam_track, visibility
     FROM ptn.packages
 "#;
 
@@ -126,8 +146,8 @@ impl PackageRepository for PostgresPackageRepository {
             r#"INSERT INTO ptn.packages
                 (name, package_type, original_price, sale_price, validity, features,
                  badge, emoji, icon_type, icon_name, icon_url, banner_url, gradient, accent_color, active,
-                 sort_order, created_by, elective_pick_count, exam_track)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                 sort_order, created_by, elective_pick_count, exam_track, visibility)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
                RETURNING id"#,
         )
         .bind(&n.name)
@@ -149,6 +169,7 @@ impl PackageRepository for PostgresPackageRepository {
         .bind(created_by)
         .bind(n.elective_pick_count)
         .bind(exam_track_str(n.exam_track))
+        .bind(visibility_str(n.visibility))
         .fetch_one(&mut *tx)
         .await?;
 
@@ -187,7 +208,7 @@ impl PackageRepository for PostgresPackageRepository {
                 validity = $6, features = $7, badge = $8, emoji = $9, icon_type = $10,
                 icon_name = $11, icon_url = $12, banner_url = $13, gradient = $14, accent_color = $15,
                 active = $16, sort_order = $17, updated_at = now(), elective_pick_count = $18,
-                exam_track = $19
+                exam_track = $19, visibility = $20
                WHERE public_id = $1"#,
         )
         .bind(id)
@@ -209,6 +230,7 @@ impl PackageRepository for PostgresPackageRepository {
         .bind(u.sort_order)
         .bind(u.elective_pick_count)
         .bind(exam_track_str(u.exam_track))
+        .bind(visibility_str(u.visibility))
         .execute(&mut *tx)
         .await?;
 

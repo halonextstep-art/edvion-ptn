@@ -157,6 +157,10 @@ pub struct SimulationTemplateResponse {
     /// templates rather than presenting this as exact.
     pub total_duration_minutes: i32,
     pub slots: Vec<SimulationTemplateSlotResponse>,
+    /// See `domain::simulation::SimulationTemplate::has_runs` doc comment — the admin edit
+    /// form uses this to disable the slot editor with an explanation rather than silently
+    /// discarding slot edits.
+    pub has_runs: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -190,6 +194,7 @@ impl From<SimulationTemplate> for SimulationTemplateResponse {
             lockdown_override: t.lockdown_override,
             total_duration_minutes,
             slots,
+            has_runs: t.has_runs,
             created_at: t.created_at,
         }
     }
