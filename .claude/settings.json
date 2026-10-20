@@ -82,7 +82,8 @@
       "Bash(PGPASSWORD=edvionu1ngu1ng psql \"postgres://postgres@72.62.126.189:5432/lms\" -c \"SELECT column_name, column_default FROM information_schema.columns WHERE table_schema='ptn' AND table_name='packages' AND column_name='visibility';\")",
       "Bash(PGPASSWORD=edvionu1ngu1ng psql \"postgres://postgres@72.62.126.189:5432/lms\" -c \"SELECT version, description FROM public._sqlx_migrations WHERE version IN \\(20260101000011, 20260101000012\\);\")",
       "Bash(PGPASSWORD=edvionu1ngu1ng psql \"postgres://postgres@72.62.126.189:5432/lms\" -c \"SELECT count\\(*\\) FROM core.tenant;\" -c \"SELECT count\\(*\\) FROM core.akun;\")",
-      "Bash(PGPASSWORD=edvionu1ngu1ng psql \"postgres://postgres@72.62.126.189:5432/lms\" -f /private/tmp/claude-501/-Users-user-project-next-ptn/202f241a-c358-4c82-971c-66be5d6e1872/scratchpad/wipe_content.sql)"
+      "Bash(PGPASSWORD=edvionu1ngu1ng psql \"postgres://postgres@72.62.126.189:5432/lms\" -f /private/tmp/claude-501/-Users-user-project-next-ptn/202f241a-c358-4c82-971c-66be5d6e1872/scratchpad/wipe_content.sql)",
+      "Bash(git push *)"
     ]
   }
 }
